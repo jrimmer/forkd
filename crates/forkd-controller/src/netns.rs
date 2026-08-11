@@ -84,21 +84,37 @@ pub trait NetnsProbe: Send + Sync {
 }
 
 /// A probe that checks the real netns directory.
+///
+/// Caches the provisioned index set at construction time so `reserve()`
+/// does not do a filesystem stat per candidate index while holding the
+/// allocator locks. The provisioned pool is static until `netns-setup.sh`
+/// runs and the daemon restarts (review #282).
 pub struct DiskNetnsProbe {
-    netns_dir: std::path::PathBuf,
+    provisioned: HashSet<usize>,
 }
 
 impl DiskNetnsProbe {
     pub fn new(netns_dir: impl Into<std::path::PathBuf>) -> Self {
-        Self {
-            netns_dir: netns_dir.into(),
+        let netns_dir = netns_dir.into();
+        let mut provisioned = HashSet::new();
+        if let Ok(rd) = std::fs::read_dir(&netns_dir) {
+            for entry in rd.flatten() {
+                if let Some(s) = entry.file_name().to_str() {
+                    if let Some(idx) = s.strip_prefix("forkd-child-") {
+                        if let Ok(i) = idx.parse::<usize>() {
+                            provisioned.insert(i);
+                        }
+                    }
+                }
+            }
         }
+        Self { provisioned }
     }
 }
 
 impl NetnsProbe for DiskNetnsProbe {
     fn exists(&self, index: usize) -> bool {
-        self.netns_dir.join(format!("forkd-child-{index}")).exists()
+        self.provisioned.contains(&index)
     }
 }
 
@@ -151,23 +167,14 @@ impl NetnsAllocator {
     }
 
     /// Discover the provisioned pool by scanning the netns directory
-    /// (max existing `forkd-child-N` index).
+    /// (max existing `forkd-child-N` index). The probe caches the full
+    /// provisioned index set at construction time so `reserve()` avoids
+    /// per-index filesystem stats (review #282).
     pub fn discover(netns_dir: impl Into<std::path::PathBuf>) -> Arc<Self> {
         let netns_dir = netns_dir.into();
-        let mut max = 0usize;
-        if let Ok(rd) = std::fs::read_dir(&netns_dir) {
-            for entry in rd.flatten() {
-                let name = entry.file_name();
-                if let Some(s) = name.to_str() {
-                    if let Some(idx) = s.strip_prefix("forkd-child-") {
-                        if let Ok(i) = idx.parse::<usize>() {
-                            max = max.max(i);
-                        }
-                    }
-                }
-            }
-        }
-        Self::new(max, Box::new(DiskNetnsProbe::new(netns_dir)))
+        let probe = DiskNetnsProbe::new(&netns_dir);
+        let max = probe.provisioned.iter().copied().max().unwrap_or(0);
+        Self::new(max, Box::new(probe))
     }
 
     /// Highest provisioned index.
@@ -365,5 +372,47 @@ mod tests {
         assert!(a.reserve(1).is_some());
         drop(a.reserve(1));
         assert!(a.reserve(2).is_none(), "index 2 is not provisioned");
+    }
+
+    #[test]
+    fn concurrent_reservations_skip_committed_active() {
+        // Thread A reserves n=4 and commits (simulating live VMs owning
+        // indices 1..4), then 32 threads reserve(1) under a barrier and
+        // assert none overlap the committed range.
+        let a = alloc(256);
+        let mut committed = a.reserve(4).expect("commit r");
+        committed.commit(); // indices 1..4 are now ACTIVE
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(33));
+        let handles: Vec<_> = (0..32)
+            .map(|_| {
+                let a = Arc::clone(&a);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let r = a.reserve(1).expect("reserve in pool");
+                    barrier.wait();
+                    r.offset() + 1 // the actual index
+                })
+            })
+            .collect();
+        barrier.wait();
+        let indices: Vec<usize> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        // No thread should have received an index in the committed
+        // range (1..=4).
+        for &idx in &indices {
+            assert!(idx > 4, "thread got committed index {idx}");
+        }
+        // All 32 indices must be disjoint.
+        let mut sorted = indices.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), 32, "indices not disjoint: {indices:?}");
+
+        // After releasing the committed range, index 1 is reusable.
+        for idx in 1..=4 {
+            a.release_index(idx);
+        }
+        assert_eq!(a.reserve(1).unwrap().offset(), 0);
     }
 }

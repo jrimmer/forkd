@@ -1338,33 +1338,37 @@ async fn create_sandbox(
 }
 
 async fn delete_sandbox(State(s): State<SharedState>, Path(id): Path<String>) -> Response {
-    // Drop kills the firecracker process and removes the cgroup leaf.
+    // Remove the VM from live_vms, kill firecracker (Vm::drop), then
+    // release the netns index. Killing before releasing closes the
+    // window where a new spawn could enter forkd-child-N while the
+    // previous owner is still dying (review #282).
     let vm = s.live_vms.lock().remove(&id);
-    // The VM is gone from live_vms: release its netns index so the pool
-    // can hand it out again (review #282 round 2 — committed ranges stay
-    // active until explicit release).
-    if let Some(v) = vm.as_ref() {
-        release_vm_netns(&s, v);
-    }
+    let netns = vm.as_ref().and_then(|v| v.netns.clone());
+    drop(vm); // kills firecracker + cleans cgroup
+    release_netns_index(&s, netns.as_deref());
     let registered = match s.registry.remove_sandbox(&id) {
         Ok(v) => v,
         Err(e) => return server_error(&format!("registry remove: {e}")),
     };
-    drop(vm);
     if registered.is_none() {
         return not_found(&format!("sandbox {id}"));
     }
     StatusCode::NO_CONTENT.into_response()
 }
 
-/// Release the netns index owned by a VM that is leaving `live_vms`.
-/// The VM's `netns` string is `forkd-child-N`; parse N and return it to
-/// the allocator's active pool. No-op when the VM has no netns.
-fn release_vm_netns(s: &SharedState, vm: &forkd_vmm::Vm) {
-    if let Some(ns) = vm.netns.as_deref() {
+/// Release a netns index from a `forkd-child-N` string. Called after
+/// the firecracker process has been killed (Vm::drop) so the index only
+/// becomes reusable once the namespace is vacated (review #282).
+fn release_netns_index(s: &SharedState, netns: Option<&str>) {
+    if let Some(ns) = netns {
         if let Some(idx) = ns.strip_prefix("forkd-child-") {
             if let Ok(n) = idx.parse::<usize>() {
                 s.netns_alloc.release_index(n);
+            } else {
+                tracing::warn!(
+                    netns = ns,
+                    "failed to parse netns index; index leaks from active set"
+                );
             }
         }
     }
@@ -2400,6 +2404,24 @@ fn service_unavailable(msg: &str) -> Response {
 // Stateful workspaces (#116)
 // -----------------------------------------------------------------------
 
+/// Marker error for netns pool exhaustion in the workspace spawn path.
+/// Callers downcast this to return 503 (service_unavailable) instead of
+/// a generic 500, mirroring the sandbox path's early-return (review
+/// #282 round 2).
+#[derive(Debug)]
+struct NetnsExhausted;
+
+impl std::fmt::Display for NetnsExhausted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "netns pool exhausted: every provisioned forkd-child-N namespace is in use \
+             (run scripts/netns-setup.sh N with a larger N and restart)",
+        )
+    }
+}
+
+impl std::error::Error for NetnsExhausted {}
+
 /// Spawn one sandbox from a snapshot tag and return the resulting
 /// `forkd_vmm::Vm` + the daemon-side metadata, without inserting into
 /// the live_vms / Registry. Workspace endpoints insert into those
@@ -2441,10 +2463,7 @@ fn spawn_one_for_workspace(
         match s.netns_alloc.reserve(1) {
             Some(r) => Some(r),
             None => {
-                anyhow::bail!(
-                    "netns pool exhausted: every provisioned forkd-child-N namespace is in use \
-                     (run scripts/netns-setup.sh N with a larger N and restart)"
-                )
+                return Err(anyhow::Error::new(NetnsExhausted));
             }
         }
     } else {
@@ -2522,6 +2541,9 @@ async fn create_workspace(
 
     let (vm, sb_info, mut netns_reservation) = match spawn_result {
         Ok(Ok(triple)) => triple,
+        Ok(Err(e)) if e.downcast_ref::<NetnsExhausted>().is_some() => {
+            return service_unavailable(&format!("{e:#}"));
+        }
         Ok(Err(e)) => return server_error(&format!("spawn workspace sandbox: {e:#}")),
         Err(e) => return server_error(&format!("blocking task panicked: {e}")),
     };
@@ -2565,9 +2587,13 @@ async fn delete_workspace(State(s): State<SharedState>, Path(name): Path<String>
     // Kill the live sandbox if any.
     if let Some(sb_id) = &ws.live_sandbox_id {
         if let Some(vm) = s.live_vms.lock().remove(sb_id) {
-            // VM leaves live_vms: release its netns index (review #282).
-            release_vm_netns(&s, &vm);
+            // Kill firecracker first, then release the netns index,
+            // closing the window where a new spawn could enter
+            // forkd-child-N while the previous owner is still dying
+            // (review #282).
+            let netns = vm.netns.clone();
             drop(vm); // Vm::drop kills firecracker + cleans cgroup
+            release_netns_index(&s, netns.as_deref());
         }
         let _ = s.registry.remove_sandbox(sb_id);
     }
@@ -2709,9 +2735,12 @@ async fn suspend_workspace(
 
     // We took the VM out of live_vms for suspend; intentionally
     // discard it now (suspend == kill source after snapshotting).
-    // Release its netns index before dropping (review #282).
-    release_vm_netns(&s, &vm_back);
+    // Kill firecracker first, then release the netns index so the
+    // namespace is vacated before the index becomes reusable
+    // (review #282).
+    let netns = vm_back.netns.clone();
     drop(vm_back);
+    release_netns_index(&s, netns.as_deref());
     let _ = s.registry.remove_sandbox(&sb_id);
 
     let (snap, pause_ms) = match snap_or_err {
@@ -2798,8 +2827,11 @@ async fn resume_workspace(State(s): State<SharedState>, Path(name): Path<String>
         spawn_one_for_workspace(&s_clone, &spawn_tag, per_child_netns, None)
     })
     .await;
-    let (vm, sb_info, _netns_reservation) = match spawn_result {
+    let (vm, sb_info, mut netns_reservation) = match spawn_result {
         Ok(Ok(triple)) => triple,
+        Ok(Err(e)) if e.downcast_ref::<NetnsExhausted>().is_some() => {
+            return service_unavailable(&format!("{e:#}"));
+        }
         Ok(Err(e)) => return server_error(&format!("spawn workspace sandbox: {e:#}")),
         Err(e) => return server_error(&format!("blocking task panicked: {e}")),
     };
@@ -2808,6 +2840,16 @@ async fn resume_workspace(State(s): State<SharedState>, Path(name): Path<String>
         tracing::error!(error=%e, "persist workspace's live sandbox failed");
     }
     s.live_vms.lock().insert(id.clone(), vm);
+    // Registration complete: the netns reservation transfers to live_vms
+    // (security review #282). On spawn failure the reservation is dropped
+    // and released automatically.  This mirrors create_workspace — the
+    // previous binding `_netns_reservation` (underscore = unused) dropped
+    // the reservation uncommitted, releasing the indices while the
+    // resumed VM was still live and re-opening the exact race #282 fixes
+    // (review #282 round 2).
+    if let Some(res) = netns_reservation.as_mut() {
+        res.commit();
+    }
 
     let now = unix_now();
     if let Err(e) = s.registry.update_workspace(&name, |w| {
@@ -3694,6 +3736,108 @@ mod tests {
             resp.status(),
             StatusCode::SERVICE_UNAVAILABLE,
             "netns exhaustion must be 503, not a generic 500"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_workspace_netns_exhaustion_returns_503() {
+        // Workspace create must map netns exhaustion to 503, not 500,
+        // consistent with the sandbox path (review #282 round 2).
+        let state = test_state_with_netns(0);
+        let dir = state.snapshot_root.join("base");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("vmstate"), b"fake-vmstate").unwrap();
+        std::fs::write(dir.join("memory.bin"), b"fake-memory").unwrap();
+
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/workspaces")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"name":"ws-test","snapshot_tag":"base","per_child_netns":true}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "workspace netns exhaustion must be 503, not a generic 500"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_workspace_netns_exhaustion_returns_503() {
+        // Resume must also map netns exhaustion to 503, not 500
+        // (review #282 round 2). We set up a suspended workspace
+        // (no live sandbox) with a state snapshot to resume from.
+        let state = test_state_with_netns(0);
+        let state_dir = state.snapshot_root.join("ws-test-state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::write(state_dir.join("vmstate"), b"fake-vmstate").unwrap();
+        std::fs::write(state_dir.join("memory.bin"), b"fake-memory").unwrap();
+        let snap = forkd_vmm::Snapshot {
+            vmstate: state_dir.join("vmstate"),
+            memory: state_dir.join("memory.bin"),
+            volumes: Vec::new(),
+            parent_tag: None,
+            parent_content_hash: None,
+            rootfs: None,
+        };
+        std::fs::write(
+            state_dir.join("snapshot.json"),
+            serde_json::to_vec_pretty(&snap).unwrap(),
+        )
+        .unwrap();
+        let snap_info = crate::api::SnapshotInfo {
+            tag: "ws-test-state".into(),
+            dir: state_dir.display().to_string(),
+            created_at_unix: 1,
+            branched_from: None,
+            pause_ms: None,
+            diff_ms: None,
+            diff_physical_bytes: None,
+            diff_logical_bytes: None,
+            warning: None,
+            status: crate::api::SnapshotStatus::Ready,
+            bootable: true,
+        };
+        state.registry.insert_snapshot(snap_info).unwrap();
+        // Insert a Suspended workspace so resume is valid.
+        let ws = WorkspaceInfo {
+            id: "ws-test".into(),
+            name: "ws-test".into(),
+            source_snapshot_tag: "base".into(),
+            current_state_tag: Some("ws-test-state".into()),
+            status: WorkspaceStatus::Suspended,
+            live_sandbox_id: None,
+            created_at_unix: 1,
+            last_active_unix: 1,
+            last_branch_memory_path: Some(state_dir.join("memory.bin")),
+            per_child_netns: true,
+        };
+        state.registry.insert_workspace(ws).unwrap();
+
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/workspaces/ws-test/resume")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "resume workspace netns exhaustion must be 503, not a generic 500"
         );
     }
 
