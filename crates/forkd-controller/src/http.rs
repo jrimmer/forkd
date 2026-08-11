@@ -65,6 +65,10 @@ pub struct AppState {
     /// Tracked separately for `/metrics` (`forkd_branch_concurrency_cap`)
     /// because `Semaphore` doesn't expose its initial permit count.
     pub branch_concurrency_cap: usize,
+    /// Atomic netns offset allocator (forkd-child-N). Shared by the
+    /// sandbox and workspace spawn paths so concurrent spawns never
+    /// pick overlapping offsets (security review #282).
+    pub netns_alloc: std::sync::Arc<crate::netns::NetnsAllocator>,
     /// Scratch directory used for prewarm throwaway snapshots when
     /// `CreateSandboxRequest::prewarm` is set. Mirror of
     /// `DaemonConfig::prewarm_scratch_dir`.
@@ -1112,13 +1116,27 @@ async fn create_sandbox(
     }
 
     let tag = req.snapshot_tag.clone();
-    // Compute netns offset so we don't collide with other live sandboxes'
-    // forkd-child-N indices. When per_child_netns is false this is a no-op.
-    let netns_offset = if req.per_child_netns {
-        pick_netns_offset(&s.live_vms.lock(), req.n)
+    // Reserve the netns offset range ATOMICALLY (security review #282):
+    // the old pick_netns_offset did check-then-act — it locked live_vms
+    // only while scanning, then released the lock before Firecracker
+    // started and before the VM was inserted, so two concurrent spawns
+    // could both receive the same range. The reservation is held until
+    // the VMs are registered in live_vms (commit) or the spawn fails
+    // (drop releases it).
+    let mut netns_reservation = if req.per_child_netns {
+        match s.netns_alloc.reserve(req.n) {
+            Some(r) => Some(r),
+            None => {
+                return service_unavailable(
+                    "netns pool exhausted: every provisioned forkd-child-N namespace is in use \
+                     (run scripts/netns-setup.sh N with a larger N and restart)",
+                );
+            }
+        }
     } else {
-        0
+        None
     };
+    let netns_offset = netns_reservation.as_ref().map(|r| r.offset()).unwrap_or(0);
     let opts = forkd_vmm::ForkOpts {
         n: req.n,
         per_child_netns: req.per_child_netns,
@@ -1307,6 +1325,13 @@ async fn create_sandbox(
             live.insert(id, vm);
             infos.push(info);
         }
+        // Registration complete: the netns reservation transfers to
+        // live_vms (the VM entries now own the indices). If the loop
+        // above is never reached (spawn failure), the reservation drops
+        // and releases automatically.
+        if let Some(res) = netns_reservation.as_mut() {
+            res.commit();
+        }
     }
 
     (StatusCode::CREATED, Json(infos)).into_response()
@@ -1315,6 +1340,12 @@ async fn create_sandbox(
 async fn delete_sandbox(State(s): State<SharedState>, Path(id): Path<String>) -> Response {
     // Drop kills the firecracker process and removes the cgroup leaf.
     let vm = s.live_vms.lock().remove(&id);
+    // The VM is gone from live_vms: release its netns index so the pool
+    // can hand it out again (review #282 round 2 — committed ranges stay
+    // active until explicit release).
+    if let Some(v) = vm.as_ref() {
+        release_vm_netns(&s, v);
+    }
     let registered = match s.registry.remove_sandbox(&id) {
         Ok(v) => v,
         Err(e) => return server_error(&format!("registry remove: {e}")),
@@ -1324,6 +1355,19 @@ async fn delete_sandbox(State(s): State<SharedState>, Path(id): Path<String>) ->
         return not_found(&format!("sandbox {id}"));
     }
     StatusCode::NO_CONTENT.into_response()
+}
+
+/// Release the netns index owned by a VM that is leaving `live_vms`.
+/// The VM's `netns` string is `forkd-child-N`; parse N and return it to
+/// the allocator's active pool. No-op when the VM has no netns.
+fn release_vm_netns(s: &SharedState, vm: &forkd_vmm::Vm) {
+    if let Some(ns) = vm.netns.as_deref() {
+        if let Some(idx) = ns.strip_prefix("forkd-child-") {
+            if let Ok(n) = idx.parse::<usize>() {
+                s.netns_alloc.release_index(n);
+            }
+        }
+    }
 }
 
 /// `POST /v1/sandboxes/:id/branch` — pause a running sandbox, snapshot its
@@ -1931,38 +1975,6 @@ async fn branch_sandbox(
     (StatusCode::CREATED, Json(info)).into_response()
 }
 
-/// Pick the smallest `netns_offset` such that
-/// `[offset+1 .. offset+n+1]` is disjoint from every `forkd-child-K`
-/// already registered in `live_vms`. Used to keep `POST /v1/sandboxes`
-/// batches from clashing on netns indices (the original allocator
-/// always started at 1, so a fork after a previous fork landed on
-/// `forkd-child-1` again).
-///
-/// Off-by-one note: indices are 1-based on the wire (`forkd-child-1`,
-/// not `forkd-child-0`); `netns_offset` is the *additive* offset
-/// applied before the within-batch 1..=n loop in `restore_many_with`.
-fn pick_netns_offset(live_vms: &HashMap<String, forkd_vmm::Vm>, n: usize) -> usize {
-    let used: std::collections::HashSet<usize> = live_vms
-        .values()
-        .filter_map(|vm| vm.netns.as_ref())
-        .filter_map(|s| s.strip_prefix("forkd-child-")?.parse::<usize>().ok())
-        .collect();
-    if used.is_empty() {
-        return 0;
-    }
-    // Try offsets 0, 1, 2, … until [offset+1..offset+n+1] is disjoint.
-    let mut offset = 0usize;
-    loop {
-        let range_start = offset + 1;
-        let range_end = offset + n + 1;
-        let clash = (range_start..range_end).any(|i| used.contains(&i));
-        if !clash {
-            return offset;
-        }
-        offset += 1;
-    }
-}
-
 /// Read the volumes list from a tagged snapshot's `snapshot.json` on disk.
 /// Returns an empty Vec if `snapshot.json` is missing (some legacy snapshots
 /// don't have it) — that matches the pre-volumes behaviour.
@@ -2399,7 +2411,11 @@ fn spawn_one_for_workspace(
     snapshot_tag: &str,
     per_child_netns: bool,
     memory_limit_mib: Option<u64>,
-) -> anyhow::Result<(forkd_vmm::Vm, SandboxInfo)> {
+) -> anyhow::Result<(
+    forkd_vmm::Vm,
+    SandboxInfo,
+    Option<crate::netns::NetnsReservation>,
+)> {
     let snap_dir: PathBuf = match s.registry.get_snapshot(snapshot_tag) {
         Some(s) => PathBuf::from(&s.dir),
         None => s.snapshot_root.join(snapshot_tag),
@@ -2421,11 +2437,20 @@ fn spawn_one_for_workspace(
             rootfs: None,
         },
     };
-    let netns_offset = if per_child_netns {
-        pick_netns_offset(&s.live_vms.lock(), 1)
+    let netns_reservation = if per_child_netns {
+        match s.netns_alloc.reserve(1) {
+            Some(r) => Some(r),
+            None => {
+                anyhow::bail!(
+                    "netns pool exhausted: every provisioned forkd-child-N namespace is in use \
+                     (run scripts/netns-setup.sh N with a larger N and restart)"
+                )
+            }
+        }
     } else {
-        0
+        None
     };
+    let netns_offset = netns_reservation.as_ref().map(|r| r.offset()).unwrap_or(0);
     let opts = forkd_vmm::ForkOpts {
         n: 1,
         per_child_netns,
@@ -2455,7 +2480,7 @@ fn spawn_one_for_workspace(
         last_branch_memory_path: None,
         branch_count: 0,
     };
-    Ok((vm, info))
+    Ok((vm, info, netns_reservation))
 }
 
 async fn list_workspaces(State(s): State<SharedState>) -> Response {
@@ -2495,8 +2520,8 @@ async fn create_workspace(
     })
     .await;
 
-    let (vm, sb_info) = match spawn_result {
-        Ok(Ok(pair)) => pair,
+    let (vm, sb_info, mut netns_reservation) = match spawn_result {
+        Ok(Ok(triple)) => triple,
         Ok(Err(e)) => return server_error(&format!("spawn workspace sandbox: {e:#}")),
         Err(e) => return server_error(&format!("blocking task panicked: {e}")),
     };
@@ -2506,6 +2531,12 @@ async fn create_workspace(
         tracing::error!(error=%e, "persist workspace's live sandbox failed");
     }
     s.live_vms.lock().insert(id.clone(), vm);
+    // Registration complete: the netns reservation transfers to live_vms
+    // (security review #282). On spawn failure the reservation is dropped
+    // and released automatically.
+    if let Some(res) = netns_reservation.as_mut() {
+        res.commit();
+    }
 
     let now = unix_now();
     let ws = WorkspaceInfo {
@@ -2534,6 +2565,8 @@ async fn delete_workspace(State(s): State<SharedState>, Path(name): Path<String>
     // Kill the live sandbox if any.
     if let Some(sb_id) = &ws.live_sandbox_id {
         if let Some(vm) = s.live_vms.lock().remove(sb_id) {
+            // VM leaves live_vms: release its netns index (review #282).
+            release_vm_netns(&s, &vm);
             drop(vm); // Vm::drop kills firecracker + cleans cgroup
         }
         let _ = s.registry.remove_sandbox(sb_id);
@@ -2676,6 +2709,8 @@ async fn suspend_workspace(
 
     // We took the VM out of live_vms for suspend; intentionally
     // discard it now (suspend == kill source after snapshotting).
+    // Release its netns index before dropping (review #282).
+    release_vm_netns(&s, &vm_back);
     drop(vm_back);
     let _ = s.registry.remove_sandbox(&sb_id);
 
@@ -2763,8 +2798,8 @@ async fn resume_workspace(State(s): State<SharedState>, Path(name): Path<String>
         spawn_one_for_workspace(&s_clone, &spawn_tag, per_child_netns, None)
     })
     .await;
-    let (vm, sb_info) = match spawn_result {
-        Ok(Ok(pair)) => pair,
+    let (vm, sb_info, _netns_reservation) = match spawn_result {
+        Ok(Ok(triple)) => triple,
         Ok(Err(e)) => return server_error(&format!("spawn workspace sandbox: {e:#}")),
         Err(e) => return server_error(&format!("blocking task panicked: {e}")),
     };
@@ -2815,6 +2850,10 @@ mod tests {
             branch_in_flight: Mutex::new(HashSet::new()),
             branch_sem: Arc::new(Semaphore::new(cap)),
             branch_concurrency_cap: cap,
+            netns_alloc: crate::netns::NetnsAllocator::new(
+                256,
+                Box::new(crate::netns::RangeProbe { max: 256 }),
+            ),
             prewarm_scratch_dir,
             #[cfg(target_os = "linux")]
             live_in_flight: Mutex::new(HashMap::new()),
@@ -2824,6 +2863,30 @@ mod tests {
 
     fn test_state() -> SharedState {
         test_state_with_cap(DEFAULT_BRANCH_CONCURRENCY)
+    }
+
+    /// test_state with a netns pool sized `netns_pool` (0 = exhausted).
+    fn test_state_with_netns(netns_pool: usize) -> SharedState {
+        let td = tempfile::TempDir::new().unwrap();
+        let path = td.path().join("state.json");
+        let snapshot_root = td.path().join("snapshots");
+        let prewarm_scratch_dir = td.path().join("prewarm");
+        Arc::new(AppState {
+            registry: Registry::load_or_init(path).unwrap(),
+            live_vms: Mutex::new(HashMap::new()),
+            snapshot_root,
+            branch_in_flight: Mutex::new(HashSet::new()),
+            branch_sem: Arc::new(Semaphore::new(DEFAULT_BRANCH_CONCURRENCY)),
+            branch_concurrency_cap: DEFAULT_BRANCH_CONCURRENCY,
+            netns_alloc: crate::netns::NetnsAllocator::new(
+                netns_pool,
+                Box::new(crate::netns::RangeProbe { max: netns_pool }),
+            ),
+            prewarm_scratch_dir,
+            #[cfg(target_os = "linux")]
+            live_in_flight: Mutex::new(HashMap::new()),
+            _tempdir: Some(td),
+        })
     }
 
     #[test]
@@ -3600,6 +3663,38 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn create_sandbox_netns_pool_exhaustion_returns_503() {
+        // A zero-provisioned allocator must reject the spawn with a
+        // resource-exhaustion 503 (not a generic 500) — security review
+        // #282.
+        let state = test_state_with_netns(0);
+        let dir = state.snapshot_root.join("base");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("vmstate"), b"fake-vmstate").unwrap();
+        std::fs::write(dir.join("memory.bin"), b"fake-memory").unwrap();
+
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/sandboxes")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"snapshot_tag":"base","n":1,"per_child_netns":true}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "netns exhaustion must be 503, not a generic 500"
+        );
     }
 
     #[tokio::test]

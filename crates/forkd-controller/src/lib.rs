@@ -6,6 +6,7 @@ pub mod api;
 pub mod audit;
 pub mod auth;
 pub mod http;
+pub mod netns;
 pub mod state;
 
 use anyhow::{Context, Result};
@@ -137,6 +138,10 @@ pub async fn run_daemon(cfg: DaemonConfig) -> Result<()> {
         branch_in_flight: Mutex::new(std::collections::HashSet::new()),
         branch_sem: std::sync::Arc::new(tokio::sync::Semaphore::new(branch_concurrency)),
         branch_concurrency_cap: branch_concurrency,
+        // Atomic netns offset allocator (security review #282): the
+        // bound is derived from the provisioned pool on disk instead of
+        // a magic constant.
+        netns_alloc: crate::netns::NetnsAllocator::discover("/var/run/netns"),
         prewarm_scratch_dir: cfg.prewarm_scratch_dir.clone(),
         #[cfg(target_os = "linux")]
         live_in_flight: Mutex::new(HashMap::new()),
