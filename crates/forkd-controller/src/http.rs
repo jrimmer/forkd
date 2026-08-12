@@ -1184,7 +1184,7 @@ async fn create_sandbox(
         // releases the reserved indices back to the pool. A concurrent
         // spawn can never grab the same range because the indices stay
         // in the reserved set until the task finishes (review #282 r3).
-        let mut netns_reservation = if spawn_per_child_netns {
+        let netns_reservation = if spawn_per_child_netns {
             match netns_alloc.reserve(spawn_n) {
                 Some(r) => Some(r),
                 None => return Err(anyhow::Error::new(NetnsExhausted)),
