@@ -1116,57 +1116,25 @@ async fn create_sandbox(
     }
 
     let tag = req.snapshot_tag.clone();
-    // Reserve the netns offset range ATOMICALLY (security review #282):
-    // the old pick_netns_offset did check-then-act — it locked live_vms
-    // only while scanning, then released the lock before Firecracker
-    // started and before the VM was inserted, so two concurrent spawns
-    // could both receive the same range. The reservation is held until
-    // the VMs are registered in live_vms (commit) or the spawn fails
-    // (drop releases it).
-    let mut netns_reservation = if req.per_child_netns {
-        match s.netns_alloc.reserve(req.n) {
-            Some(r) => Some(r),
-            None => {
-                return service_unavailable(
-                    "netns pool exhausted: every provisioned forkd-child-N namespace is in use \
-                     (run scripts/netns-setup.sh N with a larger N and restart)",
-                );
-            }
-        }
+    // Reserve the netns offset range INSIDE the spawn_blocking task
+    // (review #282 round 3): the old code reserved in the async handler,
+    // so if the request future was cancelled while the blocking restore
+    // ran, the handler dropped the reservation (making indices available
+    // to another request) while the restore task still used them. By
+    // owning the reservation in the blocking task, cancellation drops
+    // it only after the restore completes or fails.
+    let netns_alloc = s.netns_alloc.clone();
+    let prewarm_scratch_dir = if req.prewarm {
+        Some(s.prewarm_scratch_dir.clone())
     } else {
         None
     };
-    let netns_offset = netns_reservation.as_ref().map(|r| r.offset()).unwrap_or(0);
-    let opts = forkd_vmm::ForkOpts {
-        n: req.n,
-        per_child_netns: req.per_child_netns,
-        memory_limit_mib: req.memory_limit_mib,
-        netns_offset,
-        prewarm_scratch_dir: if req.prewarm {
-            Some(s.prewarm_scratch_dir.clone())
-        } else {
-            None
-        },
-        // Phase 6 unstable: live_fork=true opts the sandbox into
-        // memfd-backed RAM so the Phase 6 mode=live BRANCH path can
-        // arm UFFD_WP on it. Default stays File for backward compat.
-        memory_backend: if req.live_fork {
-            forkd_vmm::MemoryBackend::MemfdShared {
-                use_hugepages: req.hugepages,
-            }
-        } else {
-            forkd_vmm::MemoryBackend::File
-        },
-        // Daemon-spawned sources are the targets of BRANCH; enabling
-        // dirty-page tracking lets later BRANCHes opt into Diff
-        // snapshots (see docs/design/diff-snapshots.md). The cost is
-        // ~1 bit per page; negligible.
-        enable_diff_snapshots: true,
-    };
-    // Per-snapshot-tag work_dir would clash if two batches of the same tag
-    // ran concurrently (e.g. two branches of the same source). Mix the
-    // netns offset in so concurrent batches get distinct work_dirs.
-    let work_dir = std::env::temp_dir().join(format!("forkd-daemon-{tag}-o{netns_offset}"));
+    let spawn_n = req.n;
+    let spawn_per_child_netns = req.per_child_netns;
+    let spawn_mem_limit = req.memory_limit_mib;
+    let spawn_live_fork = req.live_fork;
+    let spawn_hugepages = req.hugepages;
+    let tag_for_work_dir = tag.clone();
 
     // v0.5 chain resolution. Resolve the chain BEFORE spawn_blocking
     // because it only reads snapshot.json files (cheap). The expensive
@@ -1207,7 +1175,51 @@ async fn create_sandbox(
     let prewarm_requested = req.prewarm;
     let mut snapshot = snapshot;
     let head_tag_for_log = req.snapshot_tag.clone();
-    let fork_result = match tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+    let (fork_result, mut netns_reservation) = match tokio::task::spawn_blocking(move || -> anyhow::Result<(forkd_vmm::ForkResult, Option<crate::netns::NetnsReservation>)> {
+        // Reserve the netns offset range INSIDE the blocking task so
+        // the reservation survives async-handler cancellation. If
+        // the handler is dropped while this task runs, the task still
+        // holds the reservation; when the task completes, its return
+        // value is dropped, which drops the uncommitted reservation and
+        // releases the reserved indices back to the pool. A concurrent
+        // spawn can never grab the same range because the indices stay
+        // in the reserved set until the task finishes (review #282 r3).
+        let mut netns_reservation = if spawn_per_child_netns {
+            match netns_alloc.reserve(spawn_n) {
+                Some(r) => Some(r),
+                None => return Err(anyhow::Error::new(NetnsExhausted)),
+            }
+        } else {
+            None
+        };
+        let netns_offset = netns_reservation.as_ref().map(|r| r.offset()).unwrap_or(0);
+        let opts = forkd_vmm::ForkOpts {
+            n: spawn_n,
+            per_child_netns: spawn_per_child_netns,
+            memory_limit_mib: spawn_mem_limit,
+            netns_offset,
+            prewarm_scratch_dir,
+            // Phase 6 unstable: live_fork=true opts the sandbox into
+            // memfd-backed RAM so the Phase 6 mode=live BRANCH path can
+            // arm UFFD_WP on it. Default stays File for backward compat.
+            memory_backend: if spawn_live_fork {
+                forkd_vmm::MemoryBackend::MemfdShared {
+                    use_hugepages: spawn_hugepages,
+                }
+            } else {
+                forkd_vmm::MemoryBackend::File
+            },
+            // Daemon-spawned sources are the targets of BRANCH; enabling
+            // dirty-page tracking lets later BRANCHes opt into Diff
+            // snapshots (see docs/design/diff-snapshots.md). The cost is
+            // ~1 bit per page; negligible.
+            enable_diff_snapshots: true,
+        };
+        // Per-snapshot-tag work_dir would clash if two batches of the same tag
+        // ran concurrently (e.g. two branches of the same source). Mix the
+        // netns offset in so concurrent batches get distinct work_dirs.
+        let work_dir =
+            std::env::temp_dir().join(format!("forkd-daemon-{tag_for_work_dir}-o{netns_offset}"));
         // v0.5 chain assembly. If `chain` is set, hash-verify each
         // parent against the recorded parent_content_hash (this is
         // the foot-gun guard committed to in the design doc), then
@@ -1260,7 +1272,7 @@ async fn create_sandbox(
                 std::thread::sleep(std::time::Duration::from_millis(backoffs_ms[attempt - 1]));
             }
             match snapshot.restore_many_with(opts.clone(), &work_dir) {
-                Ok(r) => return Ok(r),
+                Ok(r) => return Ok((r, netns_reservation)),
                 Err(e) => {
                     let msg = format!("{e:#}");
                     let is_busy = msg.contains("Resource busy")
@@ -1283,7 +1295,10 @@ async fn create_sandbox(
     })
     .await
     {
-        Ok(Ok(r)) => r,
+        Ok(Ok((fr, nr))) => (fr, nr),
+        Ok(Err(e)) if e.downcast_ref::<NetnsExhausted>().is_some() => {
+            return service_unavailable(&format!("{e:#}"));
+        }
         Ok(Err(e)) => return server_error(&format!("restore_many: {e:#}")),
         Err(e) => return server_error(&format!("blocking task panicked: {e}")),
     };
@@ -1370,6 +1385,64 @@ fn release_netns_index(s: &SharedState, netns: Option<&str>) {
                     "failed to parse netns index; index leaks from active set"
                 );
             }
+        }
+    }
+}
+
+/// Guard that kills the VM and releases its netns index on drop.
+/// Ensures netns cleanup survives async-handler cancellation: when the
+/// handler future is dropped while a spawn_blocking task is running, the
+/// task's return value (which contains this guard) is dropped, triggering
+/// cleanup — kill firecracker, then release the netns index (review #282 r3).
+struct VmNetnsGuard {
+    vm: Option<forkd_vmm::Vm>,
+    netns_index: Option<usize>,
+    alloc: std::sync::Arc<crate::netns::NetnsAllocator>,
+}
+
+impl VmNetnsGuard {
+    fn new(vm: forkd_vmm::Vm, alloc: std::sync::Arc<crate::netns::NetnsAllocator>) -> Self {
+        let netns_index = vm.netns.as_ref().and_then(|ns| {
+            ns.strip_prefix("forkd-child-")
+                .and_then(|idx| idx.parse().ok())
+        });
+        Self {
+            vm: Some(vm),
+            netns_index,
+            alloc,
+        }
+    }
+
+    /// Take the VM out of the guard without releasing the netns index.
+    /// Call this when transferring ownership to live_vms (the index
+    /// stays ACTIVE until the VM is later deleted/suspended).
+    fn into_vm(mut self) -> forkd_vmm::Vm {
+        let vm = self.vm.take().expect("guard already consumed");
+        std::mem::forget(self); // prevent Drop from running
+        vm
+    }
+}
+
+impl std::ops::Deref for VmNetnsGuard {
+    type Target = forkd_vmm::Vm;
+    fn deref(&self) -> &Self::Target {
+        self.vm.as_ref().expect("guard already consumed")
+    }
+}
+
+impl std::ops::DerefMut for VmNetnsGuard {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.vm.as_mut().expect("guard already consumed")
+    }
+}
+
+impl Drop for VmNetnsGuard {
+    fn drop(&mut self) {
+        // Vm::drop kills firecracker + cleans cgroup
+        self.vm.take();
+        // Release the netns index after the VM is killed
+        if let Some(idx) = self.netns_index {
+            self.alloc.release_index(idx);
         }
     }
 }
@@ -1517,6 +1590,9 @@ async fn branch_sandbox(
 
     // Take the VM out of live_vms briefly; we'll put it back unconditionally
     // (even on failure) unless a concurrent DELETE on the same id happened.
+    // Wrap in VmNetnsGuard so the netns index is released even if the
+    // handler is cancelled or a concurrent DELETE removes the registry
+    // entry during the BRANCH take-out window (review #282 r3).
     let vm = {
         let mut g = s.live_vms.lock();
         g.remove(&id)
@@ -1525,6 +1601,7 @@ async fn branch_sandbox(
         Some(v) => v,
         None => return not_found(&format!("sandbox {id}")),
     };
+    let vm = VmNetnsGuard::new(vm, s.netns_alloc.clone());
 
     let snap_dir_for_task = snap_dir.clone();
     let id_for_log = id.clone();
@@ -1561,7 +1638,7 @@ async fn branch_sandbox(
     type LiveWorkerSlot = Option<()>;
     let task_result = tokio::task::spawn_blocking(
         move || -> (
-            forkd_vmm::Vm,
+            VmNetnsGuard,
             anyhow::Result<forkd_vmm::Snapshot>,
             Option<u64>,
             DiffMetrics,
@@ -1816,22 +1893,22 @@ async fn branch_sandbox(
     )
     .await;
 
-    let (vm_back, snap_or_err, pause_ms, diff_metrics, live_worker) = match task_result {
+    let (vm_guard, snap_or_err, pause_ms, diff_metrics, live_worker) = match task_result {
         Ok(t) => t,
         Err(e) => {
-            // Blocking task panicked; we lost the Vm value. The OS still has the
-            // firecracker process running, but we no longer track it. Stale entry
-            // will be reaped by Registry::reconcile on next pid-alive scan.
+            // Blocking task panicked; the guard's Drop already ran during
+            // the panic unwind, killing firecracker and releasing the netns
+            // index. No further cleanup needed.
             return server_error(&format!("blocking task panicked: {e}"));
         }
     };
 
     // Re-insert the source sandbox into live_vms. If a DELETE happened during
-    // the branching window, the entry is gone from the registry; we drop the
-    // returned `vm` (its Drop kills firecracker + cleans cgroup).
+    // the branching window, the entry is gone from the registry; dropping the
+    // guard kills firecracker and releases the netns index (review #282 r3).
     let mut new_branch_count: Option<u32> = None;
     if s.registry.get_sandbox(&id).is_some() {
-        s.live_vms.lock().insert(id.clone(), vm_back);
+        s.live_vms.lock().insert(id.clone(), vm_guard.into_vm());
         // Phase 1d: record this BRANCH's memory.bin as the chain head
         // for the next diff BRANCH. Both Full and Diff modes clear the
         // dirty bitmap, so EITHER mode's output is the correct base for
@@ -1844,7 +1921,9 @@ async fn branch_sandbox(
             }
         }
     } else {
-        drop(vm_back);
+        // DELETE happened during BRANCH: guard's Drop kills firecracker
+        // and releases the netns index (review #282 r3).
+        drop(vm_guard);
     }
 
     let mut snap = match snap_or_err {
@@ -2662,13 +2741,16 @@ async fn suspend_workspace(
         Some(v) => v,
         None => return not_found(&format!("workspace's live sandbox {sb_id} is gone")),
     };
+    // Wrap in VmNetnsGuard so the netns index is released even if the
+    // handler is cancelled during the suspend task (review #282 r3).
+    let vm = VmNetnsGuard::new(vm, s.netns_alloc.clone());
     let snap_dir_for_task = snap_dir.clone();
     let source_tag = ws.source_snapshot_tag.clone();
     let source_memory_path = s.snapshot_root.join(&source_tag).join("memory.bin");
     let last_chain = ws.last_branch_memory_path.clone();
     let diff_mode = req.diff;
 
-    let task = tokio::task::spawn_blocking(move || -> (forkd_vmm::Vm, anyhow::Result<(forkd_vmm::Snapshot, Option<u64>)>) {
+    let task = tokio::task::spawn_blocking(move || -> (VmNetnsGuard, anyhow::Result<(forkd_vmm::Snapshot, Option<u64>)>) {
         let mut pause_ms: Option<u64> = None;
         let res = (|| -> anyhow::Result<forkd_vmm::Snapshot> {
             std::fs::create_dir_all(&snap_dir_for_task)?;
@@ -2728,19 +2810,24 @@ async fn suspend_workspace(
     })
     .await;
 
-    let (vm_back, snap_or_err) = match task {
+    let (vm_guard, snap_or_err) = match task {
         Ok((vm, r)) => (vm, r),
-        Err(e) => return server_error(&format!("blocking task panicked: {e}")),
+        Err(e) => {
+            // Blocking task panicked; the guard's Drop already ran during
+            // the panic unwind, killing firecracker and releasing the
+            // netns index. No further cleanup needed.
+            return server_error(&format!("blocking task panicked: {e}"));
+        }
     };
 
     // We took the VM out of live_vms for suspend; intentionally
     // discard it now (suspend == kill source after snapshotting).
-    // Kill firecracker first, then release the netns index so the
-    // namespace is vacated before the index becomes reusable
-    // (review #282).
-    let netns = vm_back.netns.clone();
-    drop(vm_back);
-    release_netns_index(&s, netns.as_deref());
+    // The guard's Drop kills firecracker and releases the netns index
+    // so the namespace is vacated before the index becomes reusable
+    // (review #282). This also handles handler cancellation: the guard
+    // is dropped when the task's return value is dropped, ensuring the
+    // index is always released (review #282 r3).
+    drop(vm_guard);
     let _ = s.registry.remove_sandbox(&sb_id);
 
     let (snap, pause_ms) = match snap_or_err {
@@ -4270,5 +4357,74 @@ mod tests {
                 "expected 400 for body: {body}",
             );
         }
+    }
+
+    // ------------------------------------------------------------
+    // Review #282 round 3 — cancellation-safety regression tests
+    // ------------------------------------------------------------
+
+    /// Verify the core invariant the VmNetnsGuard relies on: after
+    /// committing a reservation (VM enters live_vms) and then releasing
+    /// the index (guard drops on cancellation or DELETE-during-BRANCH),
+    /// the index is immediately reusable by a new reservation.
+    #[test]
+    fn committed_index_released_then_reusable() {
+        let a = crate::netns::NetnsAllocator::new(4, Box::new(crate::netns::RangeProbe { max: 4 }));
+        // Simulate create_sandbox: reserve → commit (VM in live_vms)
+        let mut r1 = a.reserve(1).expect("reserve");
+        let idx = r1.offset();
+        r1.commit();
+        // Simulate VmNetnsGuard::drop (cancellation or DELETE during BRANCH):
+        // release_index makes the index available again.
+        a.release_index(idx + 1); // reserve(1) covers index offset+1
+                                  // The released index must be reusable.
+        let r2 = a.reserve(1).expect("released index should be reusable");
+        assert_eq!(r2.offset(), idx, "released index should be picked first");
+    }
+
+    /// Verify that an uncommitted reservation held inside a blocking
+    /// task keeps indices reserved until the task completes, even if
+    /// the "handler" drops its reference. This tests the create_sandbox
+    /// fix: reserve() moved inside spawn_blocking so cancellation of the
+    /// async handler doesn't release indices while the restore runs.
+    #[test]
+    fn uncommitted_reservation_in_blocking_task_blocks_concurrent_reserve() {
+        let a = crate::netns::NetnsAllocator::new(2, Box::new(crate::netns::RangeProbe { max: 2 }));
+        // Simulate: spawn_blocking task holds an uncommitted reservation
+        let r1 = a.reserve(2).expect("reserve 2 in blocking task");
+        // Concurrent request tries to reserve — must fail because the
+        // blocking task still holds the range (even though it's only
+        // reserved, not committed).
+        assert!(
+            a.reserve(1).is_none(),
+            "concurrent reserve must not grab indices held by an in-flight blocking task"
+        );
+        // When the blocking task completes and drops its reservation
+        // (failure path), the indices become available again.
+        drop(r1);
+        assert!(
+            a.reserve(2).is_some(),
+            "indices freed after blocking task drops reservation"
+        );
+    }
+
+    /// Verify the full BRANCH/suspend lifecycle: reserve → commit →
+    /// release (guard drop). The index cycles through all three
+    /// allocator states (reserved → active → free) and returns to
+    /// the available pool.
+    #[test]
+    fn netns_index_lifecycle_reserved_active_free() {
+        let a = crate::netns::NetnsAllocator::new(1, Box::new(crate::netns::RangeProbe { max: 1 }));
+        // Phase 1: reserve (blocking task starts)
+        let mut r = a.reserve(1).expect("pool of 1 should satisfy");
+        assert!(a.reserve(1).is_none(), "pool exhausted while reserved");
+        // Phase 2: commit (VM inserted into live_vms)
+        r.commit();
+        assert!(a.reserve(1).is_none(), "pool exhausted while active");
+        // Phase 3: release (VmNetnsGuard drops — BRANCH cancellation
+        // or DELETE during take-out window)
+        a.release_index(1);
+        // Index is back in the available pool
+        assert!(a.reserve(1).is_some(), "index reusable after release");
     }
 }
