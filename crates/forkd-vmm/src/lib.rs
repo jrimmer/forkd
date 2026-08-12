@@ -957,6 +957,12 @@ fn sync_guest_clocks(children: &[Vm]) -> u128 {
             }
 
             // Agent is alive — set the guest clock to host wall time.
+            // We invoke `sh -c "date -s @<timestamp>"` because the guest
+            // agent's exec handler passes args directly to
+            // `subprocess.run(args)` — a bare `["-c", cmd]` would try
+            // to execute a program named "-c" and fail. The `sh -c`
+            // form runs the date command through the shell.
+            //
             // `date -s @<timestamp>` is supported by GNU coreutils date
             // (≥ 8.5) and busybox date (with FEATURE_DATE_COMPAT). All
             // forkd images are built from Debian/Ubuntu Docker bases,
@@ -965,10 +971,14 @@ fn sync_guest_clocks(children: &[Vm]) -> u128 {
                 Some(ns) => exec_in_netns(
                     ns,
                     addr.clone(),
-                    vec!["-c".into(), cmd],
+                    vec!["sh".into(), "-c".into(), cmd],
                     CLOCK_SYNC_EXEC_TIMEOUT,
                 ),
-                None => exec_at(&addr, vec!["-c".into(), cmd], CLOCK_SYNC_EXEC_TIMEOUT),
+                None => exec_at(
+                    &addr,
+                    vec!["sh".into(), "-c".into(), cmd],
+                    CLOCK_SYNC_EXEC_TIMEOUT,
+                ),
             };
 
             match exec_result {
@@ -3072,5 +3082,155 @@ mod tests {
             clock_sync_ms: 0,
         };
         assert_eq!(fr.clock_sync_ms, 0);
+    }
+
+    // RAII guard: removes work_dir on drop, even on panic.
+    struct WorkDirGuard(std::path::PathBuf);
+    impl Drop for WorkDirGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Integration test: sync_guest_clocks corrects a deliberately-wrong
+    /// guest clock. This isolates the scripting solution — even if the
+    /// kernel's KVM_CLOCK_REALTIME already corrected the clock after
+    /// restore, the test forces a wrong clock and verifies the sync
+    /// function fixes it. This tests the *mechanism* (date -s via guest
+    /// agent exec), not the *environment* (kernel clock behavior).
+    ///
+    /// The mock clock underneath is fine: we deliberately set the guest
+    /// clock to 2001-09-09, then run sync_guest_clocks and verify the
+    /// guest clock is corrected to the host's wall time.
+    #[test]
+    #[ignore = "requires Linux + KVM + firecracker + rootfs image"]
+    #[cfg(target_os = "linux")]
+    fn sync_guest_clocks_corrects_wrong_clock() {
+        let kernel = std::env::var("FORKD_TEST_KERNEL")
+            .unwrap_or_else(|_| "/var/lib/forkd/kernels/vmlinux".to_string());
+        let rootfs = std::env::var("FORKD_TEST_ROOTFS")
+            .expect("FORKD_TEST_ROOTFS must point to an ext4 rootfs image");
+
+        // Pre-flight: verify kernel and rootfs exist.
+        assert!(
+            std::path::Path::new(&kernel).exists(),
+            "FORKD_TEST_KERNEL not found at {kernel}"
+        );
+        assert!(
+            std::path::Path::new(&rootfs).exists(),
+            "FORKD_TEST_ROOTFS not found at {rootfs}"
+        );
+
+        let work_dir =
+            std::env::temp_dir().join(format!("forkd-clocksync-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&work_dir);
+        let _work_dir_guard = WorkDirGuard(work_dir.clone());
+
+        let addr = GUEST_AGENT_ADDR.to_string();
+
+        // Pre-flight: ensure no stale VM is already using the address.
+        assert!(
+            ping_at(&addr).is_err(),
+            "{addr} is already reachable — a stale VM may occupy the address; \
+             kill it before running this test"
+        );
+
+        let cfg = BootConfig::ext4_rw(kernel.into(), rootfs.into(), work_dir.clone())
+            .with_network(NetworkConfig::default_tap("forkd-tap0"));
+
+        let vm = Vm::boot(&cfg).expect("boot VM");
+
+        // Poll the guest agent until it responds.
+        let mut connected = false;
+        for _ in 0..60 {
+            std::thread::sleep(Duration::from_millis(500));
+            if ping_at(&addr).is_ok() {
+                connected = true;
+                break;
+            }
+        }
+        assert!(
+            connected,
+            "guest agent at {addr} did not respond within 30s; \
+             check console log at {}/fc.console",
+            work_dir.display()
+        );
+
+        // Step 1: Deliberately set the guest clock to an old time.
+        // 1000000000 = 2001-09-09T01:46:40Z — far enough in the past to
+        // be unambiguous with the host's current time.
+        let old_ts = 1_000_000_000u64;
+        let set_resp = exec_at(
+            &addr,
+            vec!["sh".into(), "-c".into(), format!("date -s @{old_ts}")],
+            Duration::from_secs(10),
+        )
+        .expect("exec date -s to set wrong clock");
+        assert_eq!(
+            set_resp.exit_code, 0,
+            "date -s @{old_ts} failed with exit {}: {}",
+            set_resp.exit_code, set_resp.stderr
+        );
+
+        // Step 2: Verify the guest clock IS wrong.
+        let wrong_resp = exec_at(
+            &addr,
+            vec!["date".into(), "-u".into(), "+%s".into()],
+            Duration::from_secs(10),
+        )
+        .expect("exec date to read wrong clock");
+        let wrong_time: u64 = wrong_resp.stdout.trim().parse().expect("parse guest time");
+        assert!(
+            wrong_time.abs_diff(old_ts) <= 2,
+            "guest clock should be ~{old_ts} after date -s, got {wrong_time}"
+        );
+
+        // Step 3: Run sync_guest_clocks — this is what #300 adds after
+        // restore. The function captures host wall time and execs
+        // `sh -c "date -s @<host_ts>"` in each child VM.
+        let elapsed_ms = sync_guest_clocks(std::slice::from_ref(&vm));
+        assert!(
+            elapsed_ms < 30_000,
+            "sync_guest_clocks took {elapsed_ms}ms, expected < 30s"
+        );
+
+        // Step 4: Verify the guest clock is now correct (close to host
+        // time). This is the key assertion — the sync function should
+        // have overwritten the mock old clock with the host's wall time.
+        let host_time = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("host time before epoch")
+            .as_secs();
+
+        let fixed_resp = exec_at(
+            &addr,
+            vec!["date".into(), "-u".into(), "+%s".into()],
+            Duration::from_secs(10),
+        )
+        .expect("exec date to read fixed clock");
+        let fixed_time: u64 = fixed_resp
+            .stdout
+            .trim()
+            .parse()
+            .expect("parse fixed guest time");
+
+        let drift = host_time.abs_diff(fixed_time);
+        assert!(
+            drift <= 5,
+            "guest clock drifts {drift}s from host after sync_guest_clocks \
+             (host={host_time}, guest={fixed_time}) — the sync function should \
+             have corrected the clock to host wall time"
+        );
+
+        // The corrected time must NOT be the old mock time.
+        assert!(
+            fixed_time.abs_diff(old_ts) > 60,
+            "guest clock ({fixed_time}) is still ~{old_ts} (the mock old time) \
+             — sync_guest_clocks did not correct the clock"
+        );
+
+        // Vm::drop kills firecracker and removes the socket.
+        // WorkDirGuard drops work_dir.
+        drop(vm);
     }
 }
