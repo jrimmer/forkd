@@ -1371,6 +1371,7 @@ async fn create_sandbox(
             spawn_ms = fork_result.spawn_ms as u64,
             restore_ms = fork_result.restore_ms as u64,
             prewarm_ms = fork_result.prewarm_ms as u64,
+            clock_sync_ms = fork_result.clock_sync_ms as u64,
             "sandbox created (prewarmed)"
         );
     }

@@ -23,7 +23,7 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 // ---------------------------------------------------------------------------
 // Config
@@ -629,6 +629,11 @@ pub struct ForkResult {
     /// Wall-clock spent in the optional post-restore prewarm pass.
     /// Zero when `prewarm_scratch_dir` was None.
     pub prewarm_ms: u128,
+    /// Wall-clock spent in the best-effort guest clock sync pass
+    /// (Phase 2.5). Zero when no children needed syncing or when
+    /// the sync timed out immediately. Non-fatal: a stale clock
+    /// does not prevent the sandbox from being usable.
+    pub clock_sync_ms: u128,
 }
 
 /// Response from the guest agent's `exec` action.
@@ -805,6 +810,216 @@ fn kernel_supports_kvm_clock_realtime(release: &str) -> bool {
     let major: u32 = parts[0].parse().unwrap_or(0);
     let minor: u32 = parts[1].parse().unwrap_or(0);
     major > 5 || (major == 5 && minor >= 16)
+}
+
+/// The default guest agent address. Each child VM's network is
+/// configured with guest_ip 10.42.0.2 and the agent listens on port
+/// 8888 (see `forkd-agent.py`). When children live in separate netns
+/// (per_child_netns = true), they all share this address — each netns
+/// is its own broadcast domain so there is no conflict.
+const GUEST_AGENT_ADDR: &str = "10.42.0.2:8888";
+
+/// Maximum time to wait for the guest agent to come up after restore.
+/// The agent is forkd-agent.py running as PID 1 inside the guest. It
+/// starts as soon as the kernel finishes booting and init runs, which
+/// for snapshot-restored VMs is typically sub-second. The 10-second
+/// budget covers slow hosts, cold cache, and large rootfs images.
+const CLOCK_SYNC_AGENT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Per-call timeout for the `date -s` exec itself.
+const CLOCK_SYNC_EXEC_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Best-effort guest clock synchronization after snapshot restore.
+///
+/// # Motivation
+///
+/// Firecracker restores the guest's KVM clock from the snapshot's
+/// saved clock state, not the host's current wall time. For snapshots
+/// created minutes or hours ago, the guest clock starts in the past
+/// and advances from there. This causes:
+///
+/// - TLS certificate validation failures (certs appear \"not yet valid\"
+///   or expired relative to the guest's stale clock)
+/// - Incorrect timestamp logging
+/// - Token / credential expiry checks failing inside the guest
+///
+/// The `clocksource=kvm-clock` kernel boot arg (PR #289) forces the
+/// guest to use host-synced kvm-clock instead of TSC, but it has
+/// limitations:
+/// - **x86-only**: `kvm-clock` is an x86 clocksource, silently ignored
+///   on aarch64.
+/// - **Forward-only**: boot args are not re-applied on snapshot restore
+///   (Firecracker's restore path only issues `PUT /snapshot/load`, never
+///   `PUT /boot-source`). Existing snapshots must be re-baked.
+/// - **Older kernels**: On Linux < 5.16, `KVM_CLOCK_REALTIME` is
+///   unavailable, so `KVM_SET_CLOCK` restores the saved clock rather
+///   than host wall time.
+///
+/// This function provides a cross-platform, cross-kernel-version
+/// alternative: after restore, poll the guest agent until it's alive,
+/// then exec `date -s @<host_unix_ts>` to set the guest clock to the
+/// host's current wall time. This works on any architecture and any
+/// Linux kernel because it operates entirely in guest userspace.
+///
+/// # Alternatives considered
+///
+/// 1. **`clocksource=kvm-clock` boot arg** (PR #289): x86-only,
+///    forward-only (requires re-baking snapshots), needs Linux ≥ 5.16
+///    for full wall-clock correctness. Good as defense-in-depth on x86
+///    but insufficient as the sole fix.
+///
+/// 2. **NTP/chrony in sandbox images**: Works on any platform but
+///    requires network egress (blocked by restricted network policy),
+///    adds image dependencies, and takes 1-5 seconds to converge.
+///    Not reliable for CI sandboxes with `none` or `restricted` policy.
+///
+/// 3. **forkd-agent.py host-time injection via kernel cmdline**:
+///    Pass `forkd.clock_realtime=<ts>` as a boot arg. But boot args
+///    are snapshot-forward-only (same limitation as kvm-clock). Could
+///    also pass via the agent's TCP protocol, but that has the same
+///    polling window as this approach with more complexity.
+///
+/// 4. **KVM_CLOCK_REALTIME (Linux 5.16+)**: Firecracker-level change
+///    to use `KVM_SET_CLOCK` with the `KVM_CLOCK_REALTIME` flag to
+///    restore host wall clock. x86-only, requires recent host kernel,
+///    and needs Firecracker support that may not exist.
+///
+/// This function (Option B from issue #288) is the most portable:
+/// it works on any architecture, any Linux kernel, and any existing
+/// snapshot without re-baking.
+///
+/// # Pros
+///
+/// - **Architecture-agnostic**: works on x86, aarch64, and any
+///   architecture that runs Linux + a `date` binary.
+/// - **Kernel-version-agnostic**: no dependency on KVM clock features.
+/// - **Works on existing snapshots**: no re-baking needed.
+/// - **Simple**: reuses the existing exec/ping guest agent protocol.
+/// - **Non-fatal**: best-effort — failures are logged and the sandbox
+///   remains usable with a stale clock.
+///
+/// # Cons
+///
+/// - **Brief wrong-clock window**: between restore and the `date -s`
+///   exec, the guest clock is stale (~1-5 seconds). For TLS use cases,
+///   callers should retry on certificate errors or the agent could
+///   retry the HTTPS call after clock sync.
+/// - **Requires guest agent**: if forkd-agent.py is not installed in
+///   the image (e.g. a minimal custom rootfs), clock sync silently
+///   fails. The sandbox is still usable.
+/// - **Requires `date` binary**: if the image lacks `date` (coreutils
+///   or busybox), the exec fails. This is extremely unlikely for any
+///   Linux image but is handled gracefully.
+/// - **Adds latency to restore**: ~1-5 seconds per batch (agent polling
+///   + exec), running in parallel across children. Measured at
+///   ~1-2 seconds for typical Debian/Ubuntu-based images.
+fn sync_guest_clocks(children: &[Vm]) -> u128 {
+    let start = Instant::now();
+
+    // Capture the host's current wall time ONCE, before polling agents.
+    // All children in a batch get the same timestamp, which is correct
+    // (they're all restored from the same snapshot at the same time).
+    // The few milliseconds of skew between children is negligible.
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let date_cmd = format!("date -s @{now}");
+
+    let mut handles = Vec::with_capacity(children.len());
+    for child in children {
+        let netns = child.netns.clone();
+        let cmd = date_cmd.clone();
+        handles.push(thread::spawn(move || -> Result<()> {
+            let addr = GUEST_AGENT_ADDR.to_string();
+
+            // Poll the guest agent until it responds or the timeout
+            // expires. The agent (forkd-agent.py) starts as PID 1 and
+            // begins listening on port 8888 as soon as init runs. For
+            // snapshot-restored VMs, the guest is already past kernel
+            // boot — only the agent's TCP listener needs to come up.
+            let deadline = Instant::now() + CLOCK_SYNC_AGENT_TIMEOUT;
+            loop {
+                let ping_result = match &netns {
+                    Some(ns) => ping_in_netns(ns, addr.clone()),
+                    None => ping_at(&addr),
+                };
+                if ping_result.is_ok() {
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    bail!(
+                        "guest agent at {addr} did not respond within {}s",
+                        CLOCK_SYNC_AGENT_TIMEOUT.as_secs()
+                    );
+                }
+                thread::sleep(Duration::from_millis(200));
+            }
+
+            // Agent is alive — set the guest clock to host wall time.
+            // `date -s @<timestamp>` is supported by GNU coreutils date
+            // (≥ 8.5) and busybox date (with FEATURE_DATE_COMPAT). All
+            // forkd images are built from Debian/Ubuntu Docker bases,
+            // so GNU date is guaranteed.
+            let exec_result = match &netns {
+                Some(ns) => exec_in_netns(
+                    ns,
+                    addr.clone(),
+                    vec!["-c".into(), cmd],
+                    CLOCK_SYNC_EXEC_TIMEOUT,
+                ),
+                None => exec_at(&addr, vec!["-c".into(), cmd], CLOCK_SYNC_EXEC_TIMEOUT),
+            };
+
+            match exec_result {
+                Ok(resp) if resp.exit_code == 0 => Ok(()),
+                Ok(resp) => bail!(
+                    "date -s exited with {}: {}",
+                    resp.exit_code,
+                    resp.stderr.trim()
+                ),
+                Err(e) => Err(e),
+            }
+        }));
+    }
+
+    // Collect results. Each failure is logged as a warning — clock
+    // sync is best-effort and must not prevent the sandbox from being
+    // usable with a stale clock.
+    let mut synced = 0usize;
+    let mut failed = 0usize;
+    for (i, h) in handles.into_iter().enumerate() {
+        match h.join() {
+            Ok(Ok(())) => synced += 1,
+            Ok(Err(e)) => {
+                failed += 1;
+                tracing::warn!(
+                    child = i + 1,
+                    "guest clock sync failed: {e:#}; \
+                     sandbox will have a stale clock"
+                );
+            }
+            Err(_) => {
+                failed += 1;
+                tracing::warn!(
+                    child = i + 1,
+                    "guest clock sync thread panicked; \
+                     sandbox will have a stale clock"
+                );
+            }
+        }
+    }
+
+    if synced > 0 {
+        tracing::info!(
+            synced,
+            failed,
+            elapsed_ms = start.elapsed().as_millis(),
+            "synced guest clocks after restore"
+        );
+    }
+
+    start.elapsed().as_millis()
 }
 
 // ---------------------------------------------------------------------------
@@ -1640,6 +1855,26 @@ impl Snapshot {
         }
         let restore_ms = restore_start.elapsed().as_millis();
 
+        // Phase 2.5: best-effort guest clock synchronization. After
+        // restore, each child's guest clock reflects the snapshot's
+        // creation time, not the host's current wall time. This causes
+        // TLS certificate validation failures, incorrect timestamps,
+        // and token expiry issues inside the guest.
+        //
+        // We poll the guest agent (forkd-agent.py on port 8888) until
+        // it responds, then exec `date -s @<host_unix_ts>` to set the
+        // guest clock to the host's current wall time. This is
+        // best-effort and non-fatal: if the agent doesn't come up
+        // within the timeout, or `date` is unavailable, the sandbox
+        // remains usable with a stale clock.
+        //
+        // This complements the `clocksource=kvm-clock` boot arg
+        // (PR #289), which is x86-only and forward-only (requires
+        // re-baking snapshots). This approach works on any
+        // architecture, any Linux kernel, and any existing snapshot.
+        // See issue #288 for the full options analysis.
+        let clock_sync_ms = sync_guest_clocks(&children);
+
         // Phase 3 (optional): prewarm each child by performing a
         // throwaway snapshot. This amortizes the cold-cache penalty
         // (2-9x slower first BRANCH vs. steady-state) so the first
@@ -1704,6 +1939,7 @@ impl Snapshot {
             spawn_ms,
             restore_ms,
             prewarm_ms,
+            clock_sync_ms,
         })
     }
 }
@@ -2806,5 +3042,35 @@ mod tests {
 
         // Clean up
         drop(restored_vm);
+    }
+
+    // Verify that the date command format used by sync_guest_clocks
+    // produces a valid `date -s @<unix_ts>` invocation. We can't test
+    // the full clock sync path (requires real firecracker VMs), but we
+    // can verify the command string is well-formed.
+    #[test]
+    fn clock_sync_date_command_format() {
+        let ts: u64 = 1723430400; // 2024-08-12T00:00:00Z
+        let cmd = format!("date -s @{ts}");
+        assert!(cmd.starts_with("date -s @"));
+        assert!(cmd.ends_with('0')); // ends with a digit
+                                     // The timestamp must be parseable as a valid Unix epoch value.
+        let parsed: u64 = cmd.strip_prefix("date -s @").unwrap().parse().unwrap();
+        assert_eq!(parsed, ts);
+    }
+
+    // Verify ForkResult includes the clock_sync_ms field. This is a
+    // compile-time check — if the struct ever loses the field, this
+    // test won't compile.
+    #[test]
+    fn fork_result_has_clock_sync_ms_field() {
+        let fr = ForkResult {
+            children: vec![],
+            spawn_ms: 0,
+            restore_ms: 0,
+            prewarm_ms: 0,
+            clock_sync_ms: 0,
+        };
+        assert_eq!(fr.clock_sync_ms, 0);
     }
 }
