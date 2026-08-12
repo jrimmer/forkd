@@ -133,8 +133,25 @@ impl BootConfig {
             // `getrandom(2)`-blocking for OpenSSL workloads.
             // RDRAND is universal on x86_64 hosts forkd targets
             // (Intel since Ivy Bridge 2012, AMD since Zen 2017).
+            // `clocksource=kvm-clock` forces the guest to use the KVM
+            // paravirtualized clock, which always reflects the host's
+            // wall clock time. Without this, the kernel boots with
+            // kvm-clock but switches to TSC early in init — and when
+            // sandboxes are created via snapshot restore, the TSC is
+            // stale (frozen at the snapshot creation time). This causes
+            // the guest wall clock to be wrong by days/weeks, breaking
+            // TLS certificate validation and any time-sensitive logic.
+            //
+            // x86_64-only: kvm-clock (CONFIG_KVM_CLOCK) is an x86
+            // paravirtualized clock. On aarch64 the parameter is
+            // silently ignored (the kernel falls back to auto-select).
+            //
+            // Forward-only on the snapshot side: existing snapshots
+            // created before this change have the kernel locked to
+            // TSC and must be re-baked via `forkd from-image` before
+            // restored sandboxes inherit the kvm-clock fix.
             boot_args:
-                "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda ro random.trust_cpu=on".into(),
+                "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda ro random.trust_cpu=on clocksource=kvm-clock".into(),
             work_dir,
             rootfs_read_only: true,
             network: None,
@@ -153,8 +170,11 @@ impl BootConfig {
             rootfs,
             vcpu_count: 2,
             mem_size_mib: 512,
+            // clocksource=kvm-clock: see quickstart() for rationale.
+            // Forward-only on the snapshot side: existing snapshots
+            // must be re-baked via `forkd from-image` to inherit this fix.
             boot_args:
-                "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw init=/forkd-init.sh random.trust_cpu=on".into(),
+                "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw init=/forkd-init.sh random.trust_cpu=on clocksource=kvm-clock".into(),
             work_dir,
             rootfs_read_only: false,
             network: None,
@@ -1791,6 +1811,15 @@ fn lseek_data_or_hole(f: &std::fs::File, offset: i64, want_data: bool) -> std::i
 mod tests {
     use super::*;
 
+    /// RAII guard that removes a directory on drop — even on panic.
+    /// Used by integration tests to avoid leaking work_dir on failure.
+    struct WorkDirGuard(std::path::PathBuf);
+    impl Drop for WorkDirGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     // #261: a deadline-bounded accept must give up instead of hanging
     // forever when no peer ever connects.
     #[test]
@@ -1842,6 +1871,26 @@ mod tests {
             cfg.boot_args
         );
         assert!(cfg.rootfs_read_only);
+        // clocksource=kvm-clock prevents the guest from switching to TSC,
+        // which is stale after snapshot restore and breaks TLS validation.
+        // Assert both presence AND that it is the last clocksource= token
+        // (a later clocksource=tsc would silently override it).
+        assert!(
+            cfg.boot_args.contains("clocksource=kvm-clock"),
+            "quickstart boot_args must include clocksource=kvm-clock: `{}`",
+            cfg.boot_args
+        );
+        let after = cfg
+            .boot_args
+            .split("clocksource=kvm-clock")
+            .nth(1)
+            .unwrap_or("");
+        assert!(
+            !after.contains("clocksource="),
+            "quickstart boot_args has a clocksource= token after kvm-clock \
+             which would override it: `{}`",
+            cfg.boot_args
+        );
     }
 
     #[test]
@@ -1924,6 +1973,22 @@ mod tests {
         );
         // and the warmup init script is referenced
         assert!(cfg.boot_args.contains("init=/forkd-init.sh"));
+        assert!(
+            cfg.boot_args.contains("clocksource=kvm-clock"),
+            "ext4_rw boot_args must include clocksource=kvm-clock: `{}`",
+            cfg.boot_args
+        );
+        let after = cfg
+            .boot_args
+            .split("clocksource=kvm-clock")
+            .nth(1)
+            .unwrap_or("");
+        assert!(
+            !after.contains("clocksource="),
+            "ext4_rw boot_args has a clocksource= token after kvm-clock \
+             which would override it: `{}`",
+            cfg.boot_args
+        );
     }
 
     #[test]
@@ -2292,5 +2357,159 @@ mod tests {
         assert_eq!(bytes, b"PRETEND-ASSEMBLED-MEMORY");
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // -----------------------------------------------------------------
+    // Integration test: boot a real Firecracker VM and verify the
+    // guest clocksource is kvm-clock (not TSC).
+    //
+    // This test verifies the *effect* of `clocksource=kvm-clock` in
+    // boot_args, not just that the string is present. It boots an
+    // actual firecracker VM with a real kernel and rootfs, waits for
+    // the guest agent, and reads
+    //   /sys/devices/system/clocksource/clocksource0/current_clocksource
+    // inside the VM.
+    //
+    // Requirements:
+    //   - Linux host with Firecracker installed
+    //   - forkd-tap0 tap device configured (run `scripts/host-tap.sh`)
+    //   - FORKD_TEST_KERNEL env var pointing to a vmlinux (default:
+    //     /var/lib/forkd/kernels/vmlinux)
+    //   - FORKD_TEST_ROOTFS env var pointing to an ext4 rootfs image
+    //     that includes python3 (for forkd-agent.py / forkd-init.sh)
+    //
+    // Run with:
+    //   FORKD_TEST_ROOTFS=/var/cache/forkd/dev-base.ext4 \
+    //     cargo test -p forkd-vmm --lib boot_vm_uses_kvm_clock -- --ignored
+    // -----------------------------------------------------------------
+    #[cfg(target_os = "linux")]
+    #[ignore = "requires firecracker, kernel, rootfs, and tap device"]
+    #[test]
+    fn boot_vm_uses_kvm_clock() {
+        let kernel = std::env::var("FORKD_TEST_KERNEL")
+            .unwrap_or_else(|_| "/var/lib/forkd/kernels/vmlinux".to_string());
+        let rootfs = std::env::var("FORKD_TEST_ROOTFS")
+            .expect("FORKD_TEST_ROOTFS must point to an ext4 rootfs image");
+
+        // Pre-flight: verify kernel and rootfs exist for actionable errors.
+        assert!(
+            std::path::Path::new(&kernel).exists(),
+            "FORKD_TEST_KERNEL not found at {kernel}"
+        );
+        assert!(
+            std::path::Path::new(&rootfs).exists(),
+            "FORKD_TEST_ROOTFS not found at {rootfs}"
+        );
+
+        let work_dir =
+            std::env::temp_dir().join(format!("forkd-clocksource-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&work_dir);
+        // RAII guard: removes work_dir on drop, even on panic.
+        let _work_dir_guard = WorkDirGuard(work_dir.clone());
+
+        let addr = "10.42.0.2:8888";
+
+        // Pre-flight: ensure no stale VM is already using 10.42.0.2.
+        assert!(
+            ping_at(addr).is_err(),
+            "10.42.0.2:8888 is already reachable — a stale VM may occupy \
+             the address; kill it before running this test"
+        );
+
+        let cfg = BootConfig::ext4_rw(kernel.into(), rootfs.into(), work_dir.clone())
+            .with_network(NetworkConfig::default_tap("forkd-tap0"));
+
+        // Boot the VM. Vm::boot blocks until Firecracker accepts
+        // InstanceStart but does NOT wait for guest userspace.
+        let vm = Vm::boot(&cfg).expect("boot VM");
+
+        // Poll the guest agent until it responds. The guest needs
+        // time to run forkd-init.sh and start the agent listener.
+        // Worst case is ~120s if the tap blocks SYN (2s connect_timeout
+        // × 60 iterations), but typically connection is refused and
+        // the loop completes in ~30s.
+        let mut connected = false;
+        for _ in 0..60 {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            if ping_at(addr).is_ok() {
+                connected = true;
+                break;
+            }
+        }
+        assert!(
+            connected,
+            "guest agent at {addr} did not respond within 30s; \
+             check console log at {}/fc.console",
+            work_dir.display()
+        );
+
+        // Read the active clocksource from inside the VM.
+        let resp = exec_at(
+            addr,
+            vec![
+                "cat".into(),
+                "/sys/devices/system/clocksource/clocksource0/current_clocksource".into(),
+            ],
+            std::time::Duration::from_secs(10),
+        )
+        .expect("exec clocksource check");
+
+        assert_eq!(
+            resp.exit_code, 0,
+            "cat clocksource failed with exit {}:\n{}",
+            resp.exit_code, resp.stderr
+        );
+        let clocksource = resp.stdout.trim();
+        assert_eq!(
+            clocksource, "kvm-clock",
+            "expected clocksource=kvm-clock but guest reports '{clocksource}' \
+             — the kernel may have switched to TSC despite the boot parameter; \
+             check if the guest kernel supports clocksource=kvm-clock"
+        );
+
+        // Verify the symptom: guest wall clock should match the host
+        // (within a tolerance). This catches the actual bug — stale
+        // TSC after snapshot restore makes the guest clock wrong by
+        // days/weeks. A fresh boot with kvm-clock should be within a
+        // few seconds of the host.
+        //
+        // Note: this test boots a fresh VM, not a snapshot-restored
+        // one. The snapshot-restore path (where stale TSC actually
+        // manifests) is not directly tested here — that would require
+        // creating a snapshot, restoring it, and re-checking. This
+        // test verifies the *mechanism* (clocksource stays kvm-clock)
+        // and the *symptom on fresh boot* (correct wall clock). A
+        // follow-up restore-path test would close the remaining gap.
+        let host_time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("host time before epoch")
+            .as_secs();
+        let time_resp = exec_at(
+            addr,
+            vec!["date".into(), "-u".into(), "+%s".into()],
+            std::time::Duration::from_secs(10),
+        )
+        .expect("exec date check");
+        assert_eq!(
+            time_resp.exit_code, 0,
+            "date command failed with exit {}: {}",
+            time_resp.exit_code, time_resp.stderr
+        );
+        let guest_time: u64 = time_resp
+            .stdout
+            .trim()
+            .parse()
+            .expect("guest date output is not a valid epoch");
+        let drift = host_time.abs_diff(guest_time);
+        assert!(
+            drift <= 5,
+            "guest wall clock drifts {drift}s from host (host={host_time}, guest={guest_time}) \
+             — kvm-clock should keep the guest synced to the host; \
+             large drift indicates the clocksource is not working as expected"
+        );
+
+        // Vm::drop kills firecracker and removes the socket.
+        // WorkDirGuard drops work_dir.
+        drop(vm);
     }
 }
