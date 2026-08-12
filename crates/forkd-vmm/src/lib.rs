@@ -912,7 +912,7 @@ const CLOCK_SYNC_EXEC_TIMEOUT: Duration = Duration::from_secs(5);
 ///   Linux image but is handled gracefully.
 /// - **Adds latency to restore**: ~1-5 seconds per batch (agent polling
 ///   + exec), running in parallel across children. Measured at
-///   ~1-2 seconds for typical Debian/Ubuntu-based images.
+///     ~1-2 seconds for typical Debian/Ubuntu-based images.
 fn sync_guest_clocks(children: &[Vm]) -> u128 {
     let start = Instant::now();
 
