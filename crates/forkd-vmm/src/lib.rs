@@ -2512,4 +2512,216 @@ mod tests {
         // WorkDirGuard drops work_dir.
         drop(vm);
     }
+
+    /// Integration test: verify kvm-clock survives snapshot/restore on
+    /// modern x86 kernels (≥ 5.16 with KVM_CLOCK_REALTIME).
+    ///
+    /// This test complements boot_vm_uses_kvm_clock (which tests fresh
+    /// boot only). The snapshot-restore path is where stale TSC actually
+    /// manifests: after restore, KVM_SET_CLOCK restores the saved clock
+    /// state from the snapshot. On Linux ≥ 5.16, the KVM_CLOCK_REALTIME
+    /// flag makes kvm-clock auto-correct to host wall time, so the boot
+    /// arg alone is sufficient. On older kernels (< 5.16) or aarch64,
+    /// the restored clock is stale — see PR #300 (guest-side date -s)
+    /// for the complementary fix.
+    ///
+    /// This test verifies #289's contribution: the boot arg keeps
+    /// kvm-clock as the clocksource through the snapshot/restore cycle,
+    /// and on modern kernels the restored clock is correct without any
+    /// guest-side intervention.
+    #[test]
+    #[ignore = "requires firecracker, kernel, rootfs, and tap device"]
+    #[cfg(target_os = "linux")]
+    fn kvm_clock_survives_snapshot_restore() {
+        let kernel = std::env::var("FORKD_TEST_KERNEL")
+            .unwrap_or_else(|_| "/var/lib/forkd/kernels/vmlinux".to_string());
+        let rootfs = std::env::var("FORKD_TEST_ROOTFS")
+            .expect("FORKD_TEST_ROOTFS must point to an ext4 rootfs image");
+
+        assert!(
+            std::path::Path::new(&kernel).exists(),
+            "FORKD_TEST_KERNEL not found at {kernel}"
+        );
+        assert!(
+            std::path::Path::new(&rootfs).exists(),
+            "FORKD_TEST_ROOTFS not found at {rootfs}"
+        );
+
+        let boot_dir =
+            std::env::temp_dir().join(format!("forkd-restore-test-boot-{}", std::process::id()));
+        let snap_dir =
+            std::env::temp_dir().join(format!("forkd-restore-test-snap-{}", std::process::id()));
+        let restore_dir =
+            std::env::temp_dir().join(format!("forkd-restore-test-restore-{}", std::process::id()));
+
+        let _ = std::fs::remove_dir_all(&boot_dir);
+        let _ = std::fs::remove_dir_all(&snap_dir);
+        let _ = std::fs::remove_dir_all(&restore_dir);
+
+        let _boot_guard = WorkDirGuard(boot_dir.clone());
+        let _snap_guard = WorkDirGuard(snap_dir.clone());
+        let _restore_guard = WorkDirGuard(restore_dir.clone());
+
+        let addr = "10.42.0.2:8888";
+
+        assert!(
+            ping_at(addr).is_err(),
+            "{addr} is already reachable — a stale VM may occupy the address; \
+             kill it before running this test"
+        );
+
+        // --- Phase 1: Boot fresh VM and verify kvm-clock ---
+
+        let cfg = BootConfig::ext4_rw(kernel.into(), rootfs.into(), boot_dir.clone())
+            .with_network(NetworkConfig::default_tap("forkd-tap0"));
+
+        let vm = Vm::boot(&cfg).expect("boot VM");
+
+        let mut connected = false;
+        for _ in 0..60 {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            if ping_at(addr).is_ok() {
+                connected = true;
+                break;
+            }
+        }
+        assert!(
+            connected,
+            "guest agent at {addr} did not respond within 30s; \
+             check console log at {}/fc.console",
+            boot_dir.display()
+        );
+
+        // Verify clocksource on fresh boot
+        let resp = exec_at(
+            addr,
+            vec![
+                "cat".into(),
+                "/sys/devices/system/clocksource/clocksource0/current_clocksource".into(),
+            ],
+            std::time::Duration::from_secs(10),
+        )
+        .expect("exec clocksource check");
+        assert_eq!(resp.exit_code, 0, "cat clocksource failed: {}", resp.stderr);
+        assert_eq!(
+            resp.stdout.trim(),
+            "kvm-clock",
+            "expected clocksource=kvm-clock on fresh boot"
+        );
+
+        // --- Phase 2: Snapshot the VM ---
+
+        vm.pause().expect("pause VM for snapshot");
+
+        let vmstate_path = snap_dir.join("vmstate.bin");
+        let memory_path = snap_dir.join("memory.bin");
+        let snapshot = vm
+            .snapshot_to(vmstate_path, memory_path, vec![])
+            .expect("create snapshot");
+
+        // Kill the original VM to free the tap device and guest agent
+        // address. Vm::drop kills firecracker and removes the socket.
+        // The tap device persists (pre-created by scripts/host-tap.sh).
+        drop(vm);
+
+        // Wait a few seconds so any stale clock would be visibly wrong.
+        // On modern kernels with KVM_CLOCK_REALTIME, kvm-clock
+        // auto-corrects on restore, so this wait doesn't affect
+        // correctness. On older kernels, the restored clock would be
+        // off by this amount (which is why PR #300 exists).
+        std::thread::sleep(std::time::Duration::from_secs(3));
+
+        // --- Phase 3: Restore from snapshot and verify kvm-clock ---
+
+        assert!(
+            ping_at(addr).is_err(),
+            "{addr} is still reachable after killing the source VM"
+        );
+
+        let opts = ForkOpts {
+            n: 1,
+            per_child_netns: false,
+            memory_limit_mib: None,
+            netns_offset: 0,
+            prewarm_scratch_dir: None,
+            memory_backend: MemoryBackend::File,
+            enable_diff_snapshots: false,
+        };
+
+        let fork_result = snapshot
+            .restore_many_with(opts, &restore_dir)
+            .expect("restore from snapshot");
+
+        assert_eq!(
+            fork_result.children.len(),
+            1,
+            "expected 1 restored child, got {}",
+            fork_result.children.len()
+        );
+
+        let mut restored_vm = fork_result.children.into_iter().next().unwrap();
+
+        // Wait for guest agent on the restored VM
+        let mut connected = false;
+        for _ in 0..60 {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            if ping_at(addr).is_ok() {
+                connected = true;
+                break;
+            }
+        }
+        assert!(
+            connected,
+            "guest agent at {addr} did not respond after restore within 30s; \
+             check console log at {}/child-1.console",
+            restore_dir.display()
+        );
+
+        // Verify clocksource is still kvm-clock after restore
+        let resp = exec_at(
+            addr,
+            vec![
+                "cat".into(),
+                "/sys/devices/system/clocksource/clocksource0/current_clocksource".into(),
+            ],
+            std::time::Duration::from_secs(10),
+        )
+        .expect("exec clocksource check after restore");
+        assert_eq!(resp.exit_code, 0, "cat clocksource failed: {}", resp.stderr);
+        assert_eq!(
+            resp.stdout.trim(),
+            "kvm-clock",
+            "clocksource changed after snapshot/restore — \
+             expected kvm-clock to persist"
+        );
+
+        // Verify wall clock is correct after restore. On modern x86
+        // (≥ 5.16), KVM_CLOCK_REALTIME makes kvm-clock auto-correct to
+        // host time on restore. On older kernels, the clock would be
+        // stale — that gap is addressed by PR #300 (guest-side date -s
+        // after restore).
+        let host_time = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .expect("host time before epoch")
+            .as_secs();
+        let time_resp = exec_at(
+            addr,
+            vec!["date".into(), "-u".into(), "+%s".into()],
+            std::time::Duration::from_secs(10),
+        )
+        .expect("exec date check after restore");
+        assert_eq!(time_resp.exit_code, 0, "date failed: {}", time_resp.stderr);
+        let guest_time: u64 = time_resp.stdout.trim().parse().expect("parse guest time");
+        let drift = host_time.abs_diff(guest_time);
+        assert!(
+            drift <= 5,
+            "guest wall clock drifts {drift}s from host after restore \
+             (host={host_time}, guest={guest_time}) — on modern kernels (≥ 5.16) \
+             KVM_CLOCK_REALTIME should auto-correct kvm-clock; if this fails on \
+             an older kernel, that's expected — see PR #300 for the complementary fix"
+        );
+
+        // Clean up
+        drop(restored_vm);
+    }
 }
