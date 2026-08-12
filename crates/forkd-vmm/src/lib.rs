@@ -2659,7 +2659,7 @@ mod tests {
             fork_result.children.len()
         );
 
-        let mut restored_vm = fork_result.children.into_iter().next().unwrap();
+        let restored_vm = fork_result.children.into_iter().next().unwrap();
 
         // Wait for guest agent on the restored VM
         let mut connected = false;
