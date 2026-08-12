@@ -267,22 +267,62 @@ impl Registry {
         Ok(pruned)
     }
 
+    /// Mark any `Running` workspace whose `live_sandbox_id` is no longer
+    /// present in `sandboxes` as `Stale`. We don't touch Suspended
+    /// workspaces; they were intentionally parked.
+    ///
+    /// Used by `kill_orphans` (after pruning orphaned processes) to keep
+    /// the workspace/liveness view consistent. Returns whether anything
+    /// changed.
+    fn mark_stale_workspaces(&self) -> bool {
+        let live_ids: std::collections::HashSet<String> =
+            self.inner.lock().sandboxes.keys().cloned().collect();
+        let mut changed = false;
+        {
+            let mut g = self.inner.lock();
+            for ws in g.workspaces.values_mut() {
+                if ws.status == WorkspaceStatus::Running {
+                    let live = ws
+                        .live_sandbox_id
+                        .as_ref()
+                        .is_some_and(|id| live_ids.contains(id));
+                    if !live {
+                        ws.status = WorkspaceStatus::Stale;
+                        ws.live_sandbox_id = None;
+                        changed = true;
+                    }
+                }
+            }
+        }
+        changed
+    }
+
     /// Kill orphaned Firecracker processes on startup (issue #298).
+    ///
+    /// **MUST only be called before any `Vm` handle is held** (i.e. in
+    /// `run_daemon` before `live_vms` is populated). This method
+    /// SIGKILLs every sandbox entry whose PID is alive — it cannot
+    /// distinguish an orphaned VM from a currently managed one.
     ///
     /// After `reconcile()` prunes entries with dead PIDs, any remaining
     /// sandbox entries have alive PIDs — but the controller has no
     /// `live_vms` handle for them (the controller restarted). These are
     /// orphaned Firecracker processes: alive but unmanageable.
     ///
-    /// This method kills each orphan (after verifying the PID still
-    /// belongs to a Firecracker process — guards against PID reuse),
-    /// prunes the registry entry, and marks any workspace whose
-    /// live_sandbox_id was killed as Stale.
+    /// For each orphan: verify the PID still belongs to a Firecracker
+    /// process (guards against PID reuse), send SIGKILL, wait for the
+    /// process to exit (bounded timeout), then prune the registry entry.
+    /// If the kill fails with a real error (not ESRCH), the entry is
+    /// **not** pruned — a live orphan holding resources must stay
+    /// registered so the operator can investigate.
     ///
     /// After this, the NetnsAllocator (empty active set) and
-    /// shared_tap_owner (None) are safe: no orphaned VM holds a
-    /// netns index or the shared tap.
-    pub fn kill_orphans(&self) -> Result<usize> {
+    /// shared_tap_owner (None) are safe once all orphans are confirmed
+    /// dead: no orphaned VM holds a netns index or the shared tap.
+    /// If some kills failed, those entries remain in the registry and
+    /// the allocator may still collide with them — the caller should
+    /// log the failure count and the operator should investigate.
+    pub(crate) fn kill_orphans(&self) -> Result<KillOrphansResult> {
         let orphans: Vec<(String, u32)> = {
             let g = self.inner.lock();
             g.sandboxes
@@ -295,6 +335,10 @@ impl Registry {
         };
 
         let mut killed = 0usize;
+        let mut pruned_stale = 0usize;
+        let mut kill_failed = 0usize;
+        let mut skip_ids: Vec<String> = Vec::new();
+
         for (id, pid) in orphans {
             if pid_is_firecracker(pid) {
                 tracing::warn!(
@@ -302,13 +346,48 @@ impl Registry {
                     pid = pid,
                     "killing orphaned Firecracker process on startup"
                 );
-                if let Err(e) = kill_pid(pid) {
-                    tracing::error!(
-                        sandbox_id = %id,
-                        pid = pid,
-                        error = %e,
-                        "failed to kill orphaned Firecracker process; pruning registry entry anyway"
-                    );
+                match kill_pid(pid) {
+                    Ok(()) => {
+                        // Wait for the process to actually exit (bounded).
+                        // SIGKILL is asynchronous; a D-state process can
+                        // hold netns/tap resources past the kill return.
+                        if wait_for_death(pid, std::time::Duration::from_secs(5)) {
+                            self.inner.lock().sandboxes.remove(&id);
+                            killed += 1;
+                        } else {
+                            tracing::error!(
+                                sandbox_id = %id,
+                                pid = pid,
+                                "orphaned Firecracker did not exit within 5s of SIGKILL;                                  keeping registry entry to prevent resource collision"
+                            );
+                            kill_failed += 1;
+                            skip_ids.push(id);
+                        }
+                    }
+                    Err(e) if e.raw_os_error() == Some(libc::ESRCH) => {
+                        // Process already dead (benign TOCTOU race between
+                        // pid_alive and kill_pid) — safe to prune.
+                        tracing::debug!(
+                            sandbox_id = %id,
+                            pid = pid,
+                            "orphan already exited (ESRCH); pruning registry entry"
+                        );
+                        self.inner.lock().sandboxes.remove(&id);
+                        pruned_stale += 1;
+                    }
+                    Err(e) => {
+                        // Real kill failure (EPERM, etc.) — do NOT prune.
+                        // The orphan may still be alive holding resources;
+                        // pruning would recreate the exact bug #298 fixes.
+                        tracing::error!(
+                            sandbox_id = %id,
+                            pid = pid,
+                            error = %e,
+                            "failed to kill orphaned Firecracker process;                              keeping registry entry to prevent resource collision"
+                        );
+                        kill_failed += 1;
+                        skip_ids.push(id);
+                    }
                 }
             } else {
                 tracing::warn!(
@@ -316,37 +395,20 @@ impl Registry {
                     pid = pid,
                     "PID no longer belongs to Firecracker (PID reuse); pruning stale registry entry"
                 );
-            }
-            self.inner.lock().sandboxes.remove(&id);
-            killed += 1;
-        }
-
-        // Re-run workspace stale marking: workspaces whose
-        // live_sandbox_id was just pruned are now orphaned.
-        let live_ids: std::collections::HashSet<String> =
-            self.inner.lock().sandboxes.keys().cloned().collect();
-        let mut stale_ws_changed = false;
-        {
-            let mut g = self.inner.lock();
-            for ws in g.workspaces.values_mut() {
-                if ws.status == WorkspaceStatus::Running {
-                    let live = ws
-                        .live_sandbox_id
-                        .as_ref()
-                        .is_some_and(|id| live_ids.contains(id));
-                    if !live {
-                        ws.status = WorkspaceStatus::Stale;
-                        ws.live_sandbox_id = None;
-                        stale_ws_changed = true;
-                    }
-                }
+                self.inner.lock().sandboxes.remove(&id);
+                pruned_stale += 1;
             }
         }
 
-        if killed > 0 || stale_ws_changed {
+        let stale_ws = self.mark_stale_workspaces();
+        if killed > 0 || pruned_stale > 0 || stale_ws {
             self.flush()?;
         }
-        Ok(killed)
+        Ok(KillOrphansResult {
+            killed,
+            pruned_stale,
+            kill_failed,
+        })
     }
 
     /// For metrics: live counts.
@@ -354,6 +416,15 @@ impl Registry {
         let g = self.inner.lock();
         (g.snapshots.len(), g.sandboxes.len())
     }
+}
+
+/// Result of `kill_orphans`: how many were actually killed, pruned as
+/// stale (PID reuse / already dead), and how many kills failed.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct KillOrphansResult {
+    pub killed: usize,
+    pub pruned_stale: usize,
+    pub kill_failed: usize,
 }
 
 #[cfg(target_os = "linux")]
@@ -372,10 +443,22 @@ fn pid_alive(_pid: u32) -> bool {
 /// `/proc/<pid>/comm`. Guards against PID reuse: if the original
 /// Firecracker process died and the PID was recycled by the OS for
 /// a different process, we don't want to kill an unrelated process.
+///
+/// Note: `comm` is settable via `prctl(PR_SET_NAME)` and is not an
+/// identity guarantee. On a multi-tenant host where another process
+/// could set its name to "firecracker", this check is a best-effort
+/// guard, not a security boundary. The TOCTOU window between this
+/// check and `kill_pid` is acknowledged — `pidfd_open` +
+/// `pidfd_send_signal` would close it entirely (Linux 5.3+).
 #[cfg(target_os = "linux")]
 fn pid_is_firecracker(pid: u32) -> bool {
+    // Defensive guard against pid 0/1 (defense-in-depth for corrupted
+    // state.json). Real firecracker PIDs are always > 1.
+    if pid <= 1 {
+        return false;
+    }
     std::fs::read_to_string(format!("/proc/{pid}/comm"))
-        .map(|s| s.trim().contains("firecracker"))
+        .map(|s| s.trim() == "firecracker")
         .unwrap_or(false)
 }
 
@@ -388,6 +471,10 @@ fn pid_is_firecracker(_pid: u32) -> bool {
 
 /// Send SIGKILL to a process by PID. Uses libc::kill directly
 /// (we don't have a std::process::Child handle for orphaned PIDs).
+///
+/// SAFETY: `pid` is a live Linux PID verified by `pid_is_firecracker`;
+/// `SIGKILL` is a valid signal constant; `kill(2)` is sound for any
+/// `pid_t` value (returns ESRCH if the process doesn't exist).
 #[cfg(target_os = "linux")]
 fn kill_pid(pid: u32) -> std::io::Result<()> {
     let ret = unsafe { libc::kill(pid as i32, libc::SIGKILL) };
@@ -401,6 +488,28 @@ fn kill_pid(pid: u32) -> std::io::Result<()> {
 #[cfg(not(target_os = "linux"))]
 fn kill_pid(_pid: u32) -> std::io::Result<()> {
     Ok(())
+}
+
+/// Poll for process death by checking `/proc/<pid>` disappearance.
+/// Returns true if the process exited within the timeout, false if it
+/// is still alive (e.g. stuck in D-state on I/O).
+#[cfg(target_os = "linux")]
+fn wait_for_death(pid: u32, timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    let path = format!("/proc/{pid}");
+    while std::time::Instant::now() < deadline {
+        if !std::path::Path::new(&path).exists() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    !std::path::Path::new(&path).exists()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn wait_for_death(_pid: u32, _timeout: std::time::Duration) -> bool {
+    // Off-Linux: no /proc to poll; assume the process is gone.
+    true
 }
 
 #[cfg(test)]
@@ -614,9 +723,9 @@ mod tests {
 
         // kill_orphans prunes all remaining entries (alive PID but
         // not firecracker → pruned without killing).
-        let killed = r.kill_orphans().unwrap();
+        let result = r.kill_orphans().unwrap();
         // At least the alive-PID entry is pruned.
-        assert!(killed >= 1);
+        assert!(result.killed + result.pruned_stale >= 1);
         // All sandbox entries are gone.
         assert!(r.list_sandboxes().is_empty());
     }
@@ -658,8 +767,9 @@ mod tests {
         .unwrap();
 
         // kill_orphans kills the sandbox and marks the workspace Stale.
-        let killed = r.kill_orphans().unwrap();
-        assert_eq!(killed, 1);
+        let result = r.kill_orphans().unwrap();
+        assert_eq!(result.killed, 0); // not firecracker → not killed
+        assert_eq!(result.pruned_stale, 1); // pruned as stale
         assert!(r.list_sandboxes().is_empty());
 
         let ws = r.get_workspace("ws-1").unwrap();
@@ -672,7 +782,166 @@ mod tests {
         let td = TempDir::new().unwrap();
         let path = td.path().join("state.json");
         let r = Registry::load_or_init(&path).unwrap();
-        let killed = r.kill_orphans().unwrap();
-        assert_eq!(killed, 0);
+        let result = r.kill_orphans().unwrap();
+        assert_eq!(result.killed, 0);
+        assert_eq!(result.pruned_stale, 0);
+        assert_eq!(result.kill_failed, 0);
+    }
+
+    #[test]
+    fn kill_orphans_skips_pid_none_entries() {
+        let td = TempDir::new().unwrap();
+        let path = td.path().join("state.json");
+        let r = Registry::load_or_init(&path).unwrap();
+
+        // Insert a sandbox with pid: None — should be skipped by both
+        // reconcile() and kill_orphans() (the filter_map only collects
+        // Some(pid) entries).
+        r.insert_sandbox(SandboxInfo {
+            id: "sb-no-pid".into(),
+            snapshot_tag: "py".into(),
+            netns: None,
+            guest_addr: "10.42.0.2:8888".into(),
+            created_at_unix: 1,
+            pid: None,
+            memory_limit_mib: None,
+            has_branched: false,
+            last_branch_memory_path: None,
+            branch_count: 0,
+        })
+        .unwrap();
+
+        let _ = r.reconcile().unwrap();
+        let result = r.kill_orphans().unwrap();
+        assert_eq!(result.killed, 0);
+        assert_eq!(result.pruned_stale, 0);
+        assert_eq!(result.kill_failed, 0);
+        // Entry still exists — neither method touches pid:None entries.
+        assert_eq!(r.list_sandboxes().len(), 1);
+    }
+
+    #[test]
+    fn kill_orphans_marks_multiple_workspaces_stale() {
+        let td = TempDir::new().unwrap();
+        let path = td.path().join("state.json");
+        let r = Registry::load_or_init(&path).unwrap();
+
+        // Insert a sandbox with an alive PID.
+        r.insert_sandbox(SandboxInfo {
+            id: "sb-1".into(),
+            snapshot_tag: "py".into(),
+            netns: Some("forkd-child-1".into()),
+            guest_addr: "10.42.0.2:8888".into(),
+            created_at_unix: 1,
+            pid: Some(std::process::id()),
+            memory_limit_mib: None,
+            has_branched: false,
+            last_branch_memory_path: None,
+            branch_count: 0,
+        })
+        .unwrap();
+
+        // Insert two workspaces referencing the same sandbox.
+        for name in ["ws-a", "ws-b"] {
+            r.insert_workspace(WorkspaceInfo {
+                id: name.into(),
+                name: name.into(),
+                source_snapshot_tag: "py".into(),
+                current_state_tag: None,
+                status: WorkspaceStatus::Running,
+                live_sandbox_id: Some("sb-1".into()),
+                created_at_unix: 1,
+                last_active_unix: 1,
+                last_branch_memory_path: None,
+                per_child_netns: false,
+            })
+            .unwrap();
+        }
+
+        let result = r.kill_orphans().unwrap();
+        assert_eq!(result.pruned_stale, 1);
+
+        // Both workspaces should be marked Stale.
+        assert_eq!(
+            r.get_workspace("ws-a").unwrap().status,
+            WorkspaceStatus::Stale
+        );
+        assert_eq!(
+            r.get_workspace("ws-b").unwrap().status,
+            WorkspaceStatus::Stale
+        );
+    }
+
+    #[test]
+    fn kill_orphans_persists_to_disk() {
+        let td = TempDir::new().unwrap();
+        let path = td.path().join("state.json");
+        let r = Registry::load_or_init(&path).unwrap();
+
+        r.insert_sandbox(SandboxInfo {
+            id: "sb-1".into(),
+            snapshot_tag: "py".into(),
+            netns: Some("forkd-child-1".into()),
+            guest_addr: "10.42.0.2:8888".into(),
+            created_at_unix: 1,
+            pid: Some(std::process::id()),
+            memory_limit_mib: None,
+            has_branched: false,
+            last_branch_memory_path: None,
+            branch_count: 0,
+        })
+        .unwrap();
+
+        let result = r.kill_orphans().unwrap();
+        assert!(result.pruned_stale >= 1);
+
+        // Reload from disk and verify the entry is gone.
+        let r2 = Registry::load_or_init(&path).unwrap();
+        assert!(r2.list_sandboxes().is_empty());
+    }
+
+    #[test]
+    fn kill_orphans_reconcile_then_kill_integration() {
+        let td = TempDir::new().unwrap();
+        let path = td.path().join("state.json");
+        let r = Registry::load_or_init(&path).unwrap();
+
+        // Dead PID entry (pruned by reconcile).
+        r.insert_sandbox(SandboxInfo {
+            id: "sb-dead".into(),
+            snapshot_tag: "py".into(),
+            netns: Some("forkd-child-1".into()),
+            guest_addr: "10.42.0.2:8888".into(),
+            created_at_unix: 1,
+            pid: Some(99999999),
+            memory_limit_mib: None,
+            has_branched: false,
+            last_branch_memory_path: None,
+            branch_count: 0,
+        })
+        .unwrap();
+
+        // Alive PID entry (pruned by kill_orphans).
+        r.insert_sandbox(SandboxInfo {
+            id: "sb-alive".into(),
+            snapshot_tag: "py".into(),
+            netns: Some("forkd-child-2".into()),
+            guest_addr: "10.42.0.3:8888".into(),
+            created_at_unix: 2,
+            pid: Some(std::process::id()),
+            memory_limit_mib: None,
+            has_branched: false,
+            last_branch_memory_path: None,
+            branch_count: 0,
+        })
+        .unwrap();
+
+        let pruned = r.reconcile().unwrap();
+        let result = r.kill_orphans().unwrap();
+
+        // On Linux: reconcile prunes sb-dead (1), kill_orphans prunes sb-alive (1).
+        // On macOS: reconcile prunes 0 (all PIDs "alive"), kill_orphans prunes 2.
+        assert!(r.list_sandboxes().is_empty());
+        assert!(pruned + result.killed + result.pruned_stale >= 2);
     }
 }

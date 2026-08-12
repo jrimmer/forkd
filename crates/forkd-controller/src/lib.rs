@@ -97,9 +97,20 @@ pub async fn run_daemon(cfg: DaemonConfig) -> Result<()> {
     // live_vms handle — they are unmanageable orphans. Kill them and
     // prune the registry entries so the NetnsAllocator (empty active
     // set) and shared_tap_owner (None) start clean.
-    let killed = registry.kill_orphans()?;
-    if killed > 0 {
-        tracing::info!(killed, "killed orphaned Firecracker processes on startup");
+    let orphans = registry.kill_orphans()?;
+    if orphans.killed > 0 {
+        tracing::info!(
+            killed = orphans.killed,
+            pruned_stale = orphans.pruned_stale,
+            kill_failed = orphans.kill_failed,
+            "killed orphaned Firecracker processes on startup"
+        );
+    } else if orphans.pruned_stale > 0 || orphans.kill_failed > 0 {
+        tracing::warn!(
+            pruned_stale = orphans.pruned_stale,
+            kill_failed = orphans.kill_failed,
+            "orphan recovery: some entries pruned as stale or kill failed"
+        );
     }
 
     let audit = AuditSink::open(&cfg.audit_log)
