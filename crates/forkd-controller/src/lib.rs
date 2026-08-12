@@ -91,6 +91,17 @@ pub async fn run_daemon(cfg: DaemonConfig) -> Result<()> {
         tracing::info!(pruned, "reconciled stale sandbox entries on startup");
     }
 
+    // Kill orphaned Firecracker processes left over from a previous
+    // controller instance (issue #298). After reconcile() prunes
+    // dead-PID entries, any remaining entries have alive PIDs but no
+    // live_vms handle — they are unmanageable orphans. Kill them and
+    // prune the registry entries so the NetnsAllocator (empty active
+    // set) and shared_tap_owner (None) start clean.
+    let killed = registry.kill_orphans()?;
+    if killed > 0 {
+        tracing::info!(killed, "killed orphaned Firecracker processes on startup");
+    }
+
     let audit = AuditSink::open(&cfg.audit_log)
         .with_context(|| format!("open audit log {}", cfg.audit_log.display()))?;
     tracing::info!(audit_log = %audit.path().display(), "audit log open");
