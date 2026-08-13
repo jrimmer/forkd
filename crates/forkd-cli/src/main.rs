@@ -2277,6 +2277,7 @@ fn run_cmd(
                 prewarm_scratch_dir: None,
                 memory_backend: forkd_vmm::MemoryBackend::File,
                 enable_diff_snapshots: false,
+                sync_guest_clocks: false,
             },
             &work_dir,
         )
@@ -3128,6 +3129,7 @@ fn fork_cmd(
                 },
                 // CLI fork doesn't outlive its invocation, no diff snapshots.
                 enable_diff_snapshots: false,
+                sync_guest_clocks: false,
             },
             &work_dir,
         )

@@ -1280,6 +1280,7 @@ async fn create_sandbox(
             // snapshots (see docs/design/diff-snapshots.md). The cost is
             // ~1 bit per page; negligible.
             enable_diff_snapshots: true,
+            sync_guest_clocks: true,
         };
         // Per-snapshot-tag work_dir would clash if two batches of the same tag
         // ran concurrently (e.g. two branches of the same source). Mix the
@@ -2803,6 +2804,7 @@ fn spawn_one_for_workspace(
         prewarm_scratch_dir: None,
         memory_backend: forkd_vmm::MemoryBackend::File,
         enable_diff_snapshots: true,
+        sync_guest_clocks: true,
     };
     let work_dir =
         std::env::temp_dir().join(format!("forkd-workspace-{snapshot_tag}-o{netns_offset}"));

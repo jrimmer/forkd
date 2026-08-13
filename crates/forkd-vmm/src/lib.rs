@@ -604,6 +604,18 @@ pub struct ForkOpts {
     /// Negligible relative to the snapshot-write savings on subsequent
     /// Diff snapshots.
     pub enable_diff_snapshots: bool,
+    /// If true, after snapshot restore each child's guest clock is
+    /// synchronized to host wall time by exec'ing `date -s @<ts>`
+    /// via the guest agent (port 8888). This is the general fix for
+    /// stale guest clocks on older kernels (< 5.16) where
+    /// KVM_CLOCK_REALTIME is unavailable and the restored kvm-clock
+    /// stays at the snapshot's creation time.
+    ///
+    /// Default false: snapshots without forkd-agent (custom images)
+    /// would add up to 10 seconds per restore waiting for an agent
+    /// that never starts. Callers that know their images contain
+    /// forkd-agent (e.g. the daemon's spawn paths) set this to true.
+    pub sync_guest_clocks: bool,
 }
 
 impl Default for ForkOpts {
@@ -616,6 +628,7 @@ impl Default for ForkOpts {
             prewarm_scratch_dir: None,
             memory_backend: MemoryBackend::File,
             enable_diff_snapshots: false,
+            sync_guest_clocks: false,
         }
     }
 }
@@ -916,20 +929,9 @@ const CLOCK_SYNC_EXEC_TIMEOUT: Duration = Duration::from_secs(5);
 fn sync_guest_clocks(children: &[Vm]) -> u128 {
     let start = Instant::now();
 
-    // Capture the host's current wall time ONCE, before polling agents.
-    // All children in a batch get the same timestamp, which is correct
-    // (they're all restored from the same snapshot at the same time).
-    // The few milliseconds of skew between children is negligible.
-    let now = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let date_cmd = format!("date -s @{now}");
-
     let mut handles = Vec::with_capacity(children.len());
     for child in children {
         let netns = child.netns.clone();
-        let cmd = date_cmd.clone();
         handles.push(thread::spawn(move || -> Result<()> {
             let addr = GUEST_AGENT_ADDR.to_string();
 
@@ -956,6 +958,18 @@ fn sync_guest_clocks(children: &[Vm]) -> u128 {
                 thread::sleep(Duration::from_millis(200));
             }
 
+            // Capture the host timestamp AFTER the agent is confirmed
+            // alive, immediately before exec. The old approach captured
+            // it before polling — a child that became ready near the
+            // 10-second deadline was set ~10 seconds in the past.
+            // Capturing per-child after ping minimizes the gap between
+            // timestamp capture and the date -s exec.
+            let now = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let date_cmd = format!("date -s @{now}");
+
             // Agent is alive — set the guest clock to host wall time.
             // We invoke `sh -c "date -s @<timestamp>"` because the guest
             // agent's exec handler passes args directly to
@@ -971,12 +985,12 @@ fn sync_guest_clocks(children: &[Vm]) -> u128 {
                 Some(ns) => exec_in_netns(
                     ns,
                     addr.clone(),
-                    vec!["sh".into(), "-c".into(), cmd],
+                    vec!["sh".into(), "-c".into(), date_cmd],
                     CLOCK_SYNC_EXEC_TIMEOUT,
                 ),
                 None => exec_at(
                     &addr,
-                    vec!["sh".into(), "-c".into(), cmd],
+                    vec!["sh".into(), "-c".into(), date_cmd],
                     CLOCK_SYNC_EXEC_TIMEOUT,
                 ),
             };
@@ -1703,6 +1717,7 @@ impl Snapshot {
                 prewarm_scratch_dir: None,
                 memory_backend: MemoryBackend::File,
                 enable_diff_snapshots: false,
+                sync_guest_clocks: false,
             },
             work_dir,
         )
@@ -1721,6 +1736,19 @@ impl Snapshot {
             ),
         }
         let n = opts.n;
+        // Reject n>1 with per_child_netns=false: all children would
+        // share the same guest IP (10.42.0.2) and MAC, so the guest
+        // agent (port 8888) and all guest network traffic are
+        // ambiguous — requests can hit one VM while siblings remain
+        // unsynchronized. This topology conflict is fundamental, not
+        // a configuration issue. Use per_child_netns=true for n>1.
+        if n > 1 && !opts.per_child_netns {
+            bail!(
+                "n>1 with per_child_netns=false is not supported: all children \
+                 share the same guest IP/MAC, making per-child addressing impossible. \
+                 Use per_child_netns=true for multi-child spawns."
+            );
+        }
         std::fs::create_dir_all(work_dir).context("create fork work_dir")?;
         // Sweep everything in work_dir — including stale unix sockets, which
         // is_file() considers neither file nor dir and would otherwise leave
@@ -1883,7 +1911,11 @@ impl Snapshot {
         // re-baking snapshots). This approach works on any
         // architecture, any Linux kernel, and any existing snapshot.
         // See issue #288 for the full options analysis.
-        let clock_sync_ms = sync_guest_clocks(&children);
+        let clock_sync_ms = if opts.sync_guest_clocks {
+            sync_guest_clocks(&children)
+        } else {
+            0
+        };
 
         // Phase 3 (optional): prewarm each child by performing a
         // throwaway snapshot. This amortizes the cold-cache penalty
