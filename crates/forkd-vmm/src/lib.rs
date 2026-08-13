@@ -772,6 +772,39 @@ pub fn ping_at(addr: &str) -> Result<serde_json::Value> {
     Ok(v)
 }
 
+/// Get the host kernel release string (e.g. "6.1.0-foo").
+/// Used by tests to determine whether KVM_CLOCK_REALTIME is available
+/// (needs kernel ≥ 5.16). Returns `None` if `/proc/sys/kernel/osrelease`
+/// cannot be read (non-Linux).
+fn host_kernel_release() -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_to_string("/proc/sys/kernel/osrelease")
+            .ok()
+            .map(|s| s.trim().to_string())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+/// Parse a kernel release string (e.g. "5.15.0-foo", "6.1.0-bar") and
+/// return whether the kernel supports `KVM_CLOCK_REALTIME` (≥ 5.16).
+/// On x86 this makes kvm-clock auto-correct to host wall time on
+/// snapshot restore; on older kernels the restored kvm-clock stays
+/// stale and needs a complementary guest-side correction (PR #300).
+fn kernel_supports_kvm_clock_realtime(release: &str) -> bool {
+    // Parse the first two numeric components of the release string.
+    let parts: Vec<&str> = release.split('.').collect();
+    if parts.len() < 2 {
+        return false;
+    }
+    let major: u32 = parts[0].parse().unwrap_or(0);
+    let minor: u32 = parts[1].parse().unwrap_or(0);
+    major > 5 || (major == 5 && minor >= 16)
+}
+
 // ---------------------------------------------------------------------------
 // Private helpers
 // ---------------------------------------------------------------------------
@@ -1820,6 +1853,19 @@ mod tests {
         }
     }
 
+    #[test]
+    fn kernel_supports_kvm_clock_realtime_parses_versions() {
+        assert!(!kernel_supports_kvm_clock_realtime("5.10.0-foo"));
+        assert!(!kernel_supports_kvm_clock_realtime("5.15.0-foo"));
+        assert!(kernel_supports_kvm_clock_realtime("5.16.0-foo"));
+        assert!(kernel_supports_kvm_clock_realtime("5.16.1-foo"));
+        assert!(kernel_supports_kvm_clock_realtime("6.1.0-foo"));
+        assert!(kernel_supports_kvm_clock_realtime("6.1.141"));
+        assert!(!kernel_supports_kvm_clock_realtime("5.14.0-foo"));
+        assert!(!kernel_supports_kvm_clock_realtime("garbage"));
+        assert!(!kernel_supports_kvm_clock_realtime(""));
+    }
+
     // #261: a deadline-bounded accept must give up instead of hanging
     // forever when no peer ever connects.
     #[test]
@@ -2624,12 +2670,17 @@ mod tests {
         // The tap device persists (pre-created by scripts/host-tap.sh).
         drop(vm);
 
-        // Wait a few seconds so any stale clock would be visibly wrong.
-        // On modern kernels with KVM_CLOCK_REALTIME, kvm-clock
-        // auto-corrects on restore, so this wait doesn't affect
-        // correctness. On older kernels, the restored clock would be
-        // off by this amount (which is why PR #300 exists).
-        std::thread::sleep(std::time::Duration::from_secs(3));
+        // Wait comfortably longer than the allowed drift so a guest
+        // that simply resumes at the saved timestamp is caught. On
+        // modern kernels (≥ 5.16) KVM_CLOCK_REALTIME makes kvm-clock
+        // auto-correct on restore, so this wait doesn't affect
+        // correctness. On older kernels (5.10/5.15) the restored clock
+        // would be off by ~this amount, and the drift assertion will
+        // fail — directing the operator to PR #300 for the complementary
+        // guest-side fix. The wait must be comfortably larger than the
+        // allowed drift (≤ 2 s) so a stale clock cannot pass by accident.
+        let wait_secs: u64 = 20;
+        std::thread::sleep(std::time::Duration::from_secs(wait_secs));
 
         // --- Phase 3: Restore from snapshot and verify kvm-clock ---
 
@@ -2697,9 +2748,12 @@ mod tests {
 
         // Verify wall clock is correct after restore. On modern x86
         // (≥ 5.16), KVM_CLOCK_REALTIME makes kvm-clock auto-correct to
-        // host time on restore. On older kernels, the clock would be
-        // stale — that gap is addressed by PR #300 (guest-side date -s
-        // after restore).
+        // host time on restore. On older kernels (5.10/5.15),
+        // KVM_CLOCK_REALTIME is unavailable and the restored kvm-clock
+        // stays stale — that gap is addressed by PR #300 (guest-side
+        // date -s after restore). We detect the host kernel version
+        // here so the behavior is explicit rather than silent.
+        let host_kernel = host_kernel_release();
         let host_time = std::time::SystemTime::now()
             .duration_since(std::time::SystemTime::UNIX_EPOCH)
             .expect("host time before epoch")
@@ -2713,13 +2767,40 @@ mod tests {
         assert_eq!(time_resp.exit_code, 0, "date failed: {}", time_resp.stderr);
         let guest_time: u64 = time_resp.stdout.trim().parse().expect("parse guest time");
         let drift = host_time.abs_diff(guest_time);
-        assert!(
-            drift <= 5,
-            "guest wall clock drifts {drift}s from host after restore \
-             (host={host_time}, guest={guest_time}) — on modern kernels (≥ 5.16) \
-             KVM_CLOCK_REALTIME should auto-correct kvm-clock; if this fails on \
-             an older kernel, that's expected — see PR #300 for the complementary fix"
-        );
+
+        // The wait (20 s) is comfortably larger than the allowed drift
+        // (2 s), so a guest that resumes at the saved timestamp
+        // (~20 s in the past) cannot pass by accident.
+        let max_drift: u64 = 2;
+        let modern = host_kernel
+            .as_ref()
+            .map(|k| kernel_supports_kvm_clock_realtime(k))
+            .unwrap_or(true); // assume modern if we can't detect
+        if modern {
+            assert!(
+                drift <= max_drift,
+                "guest wall clock drifts {drift}s from host after restore \
+                 (host={host_time}, guest={guest_time}, kernel={host_kernel:?}) — \
+                 KVM_CLOCK_REALTIME (kernel ≥ 5.16) should auto-correct kvm-clock \
+                 on restore; drift > {max_drift}s means the correction is not working"
+            );
+        } else {
+            // On older kernels (5.10/5.15) KVM_CLOCK_REALTIME is
+            // unavailable. The boot-arg fix alone is insufficient —
+            // the guest clock stays stale after restore. This is the
+            // documented gap that PR #300 (guest-side date -s) fills.
+            // We still assert so the limitation is visible, but the
+            // message points to the complementary fix.
+            assert!(
+                drift <= max_drift,
+                "guest wall clock drifts {drift}s from host after restore \
+                 (host={host_time}, guest={guest_time}, kernel={host_kernel:?}) — \
+                 this kernel does not support KVM_CLOCK_REALTIME (needs ≥ 5.16); \
+                 the boot-arg fix alone cannot correct the clock on restore. \
+                 PR #300 (guest-side date -s after restore) is required for \
+                 this kernel range"
+            );
+        }
 
         // Clean up
         drop(restored_vm);
