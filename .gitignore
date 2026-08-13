@@ -22,3 +22,4 @@ build/
 # not in this public repo.
 /notes/
 Cargo.lock
+.pi-subagents/

@@ -39,6 +39,7 @@ use crate::api::{
     VersionResponse, WorkspaceInfo, WorkspaceStatus,
 };
 use crate::state::Registry;
+use forkd_vmm::ClockSyncOutcome;
 
 const API_VERSION: &str = "v1";
 const BUILD_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -1366,6 +1367,16 @@ async fn create_sandbox(
         Err(e) => return server_error(&format!("blocking task panicked: {e}")),
     };
     if prewarm_requested {
+        let clock_failures: Vec<&str> = fork_result
+            .clock_sync_outcomes
+            .iter()
+            .filter_map(|o| match o {
+                ClockSyncOutcome::Failed { child_index, error } => {
+                    Some(format!("child {child_index}: {error}"))
+                }
+                _ => None,
+            })
+            .collect();
         tracing::info!(
             tag = %tag,
             n = fork_result.children.len(),
@@ -1373,6 +1384,7 @@ async fn create_sandbox(
             restore_ms = fork_result.restore_ms as u64,
             prewarm_ms = fork_result.prewarm_ms as u64,
             clock_sync_ms = fork_result.clock_sync_ms as u64,
+            clock_sync_failures =? clock_failures,
             "sandbox created (prewarmed)"
         );
     }

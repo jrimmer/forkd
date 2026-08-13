@@ -647,6 +647,29 @@ pub struct ForkResult {
     /// the sync timed out immediately. Non-fatal: a stale clock
     /// does not prevent the sandbox from being usable.
     pub clock_sync_ms: u128,
+    /// Per-child guest clock sync outcomes (empty when clock sync
+    /// was not requested via `ForkOpts::sync_guest_clocks`).
+    /// Callers can inspect this to decide whether to fail-closed
+    /// or degrade when some children have unsynchronized clocks.
+    /// The count of `Synced` entries should match the number of
+    /// children; any `Failed` entry indicates a stale clock that
+    /// may break TLS certificate validation or token expiry.
+    pub clock_sync_outcomes: Vec<ClockSyncOutcome>,
+}
+
+/// Per-child outcome of the best-effort guest clock sync pass.
+/// Exposed via `ForkResult::clock_sync_outcomes` so callers can
+/// fail-closed or degrade when some children have unsynchronized
+/// clocks. A stale guest clock breaks TLS certificate validation
+/// and token expiry checks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ClockSyncOutcome {
+    /// The guest clock was successfully set to host wall time.
+    Synced { child_index: usize },
+    /// The guest agent did not respond within the timeout, or the
+    /// `date -s` exec failed. The sandbox is usable but has a stale
+    /// clock. `error` describes what went wrong.
+    Failed { child_index: usize, error: String },
 }
 
 /// Response from the guest agent's `exec` action.
@@ -926,11 +949,11 @@ const CLOCK_SYNC_EXEC_TIMEOUT: Duration = Duration::from_secs(5);
 /// - **Adds latency to restore**: ~1-5 seconds per batch (agent polling
 ///   + exec), running in parallel across children. Measured at
 ///     ~1-2 seconds for typical Debian/Ubuntu-based images.
-fn sync_guest_clocks(children: &[Vm]) -> u128 {
+fn sync_guest_clocks(children: &[Vm]) -> (u128, Vec<ClockSyncOutcome>) {
     let start = Instant::now();
 
     let mut handles = Vec::with_capacity(children.len());
-    for child in children {
+    for (_child_index, child) in children.iter().enumerate() {
         let netns = child.netns.clone();
         handles.push(thread::spawn(move || -> Result<()> {
             let addr = GUEST_AGENT_ADDR.to_string();
@@ -1007,21 +1030,31 @@ fn sync_guest_clocks(children: &[Vm]) -> u128 {
         }));
     }
 
-    // Collect results. Each failure is logged as a warning — clock
-    // sync is best-effort and must not prevent the sandbox from being
-    // usable with a stale clock.
+    // Collect per-child outcomes. Each failure is logged as a
+    // warning — clock sync is best-effort and must not prevent the
+    // sandbox from being usable with a stale clock. The outcomes are
+    // returned to the caller so it can fail-closed or degrade.
+    let mut outcomes = Vec::with_capacity(handles.len());
     let mut synced = 0usize;
     let mut failed = 0usize;
     for (i, h) in handles.into_iter().enumerate() {
         match h.join() {
-            Ok(Ok(())) => synced += 1,
+            Ok(Ok(())) => {
+                synced += 1;
+                outcomes.push(ClockSyncOutcome::Synced { child_index: i });
+            }
             Ok(Err(e)) => {
                 failed += 1;
+                let error = format!("{e:#}");
                 tracing::warn!(
                     child = i + 1,
-                    "guest clock sync failed: {e:#}; \
+                    "guest clock sync failed: {error}; \
                      sandbox will have a stale clock"
                 );
+                outcomes.push(ClockSyncOutcome::Failed {
+                    child_index: i,
+                    error,
+                });
             }
             Err(_) => {
                 failed += 1;
@@ -1030,6 +1063,10 @@ fn sync_guest_clocks(children: &[Vm]) -> u128 {
                     "guest clock sync thread panicked; \
                      sandbox will have a stale clock"
                 );
+                outcomes.push(ClockSyncOutcome::Failed {
+                    child_index: i,
+                    error: "clock sync thread panicked".to_string(),
+                });
             }
         }
     }
@@ -1043,7 +1080,7 @@ fn sync_guest_clocks(children: &[Vm]) -> u128 {
         );
     }
 
-    start.elapsed().as_millis()
+    (start.elapsed().as_millis(), outcomes)
 }
 
 // ---------------------------------------------------------------------------
@@ -1911,10 +1948,10 @@ impl Snapshot {
         // re-baking snapshots). This approach works on any
         // architecture, any Linux kernel, and any existing snapshot.
         // See issue #288 for the full options analysis.
-        let clock_sync_ms = if opts.sync_guest_clocks {
+        let (clock_sync_ms, clock_sync_outcomes) = if opts.sync_guest_clocks {
             sync_guest_clocks(&children)
         } else {
-            0
+            (0, Vec::new())
         };
 
         // Phase 3 (optional): prewarm each child by performing a
@@ -1982,6 +2019,7 @@ impl Snapshot {
             restore_ms,
             prewarm_ms,
             clock_sync_ms,
+            clock_sync_outcomes,
         })
     }
 }
@@ -3112,8 +3150,50 @@ mod tests {
             restore_ms: 0,
             prewarm_ms: 0,
             clock_sync_ms: 0,
+            clock_sync_outcomes: Vec::new(),
         };
         assert_eq!(fr.clock_sync_ms, 0);
+    }
+
+    // Verify ClockSyncOutcome enum discriminants and field access.
+    // This is a compile-time + runtime check that the enum is
+    // constructible and matchable as expected by callers.
+    #[test]
+    fn clock_sync_outcome_construction_and_matching() {
+        let synced = ClockSyncOutcome::Synced { child_index: 0 };
+        let failed = ClockSyncOutcome::Failed {
+            child_index: 1,
+            error: "agent timeout".to_string(),
+        };
+
+        assert!(matches!(
+            synced,
+            ClockSyncOutcome::Synced { child_index: 0 }
+        ));
+        assert!(matches!(
+            &failed,
+            ClockSyncOutcome::Failed { child_index: 1, .. }
+        ));
+
+        // Verify the error field is accessible.
+        if let ClockSyncOutcome::Failed { error, .. } = &failed {
+            assert_eq!(error, "agent timeout");
+        }
+
+        // Verify a Vec of outcomes can be filtered for failures
+        // (the pattern callers use to decide fail-closed).
+        let outcomes = vec![synced, failed];
+        let failures: Vec<&str> = outcomes
+            .iter()
+            .filter_map(|o| match o {
+                ClockSyncOutcome::Failed { child_index, error } => {
+                    Some(format!("child {child_index}: {error}"))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].contains("agent timeout"));
     }
 
     // RAII guard: removes work_dir on drop, even on panic.
@@ -3220,10 +3300,22 @@ mod tests {
         // Step 3: Run sync_guest_clocks — this is what #300 adds after
         // restore. The function captures host wall time and execs
         // `sh -c "date -s @<host_ts>"` in each child VM.
-        let elapsed_ms = sync_guest_clocks(std::slice::from_ref(&vm));
+        let (elapsed_ms, outcomes) = sync_guest_clocks(std::slice::from_ref(&vm));
         assert!(
             elapsed_ms < 30_000,
             "sync_guest_clocks took {elapsed_ms}ms, expected < 30s"
+        );
+        // Verify per-child outcome: exactly one Synced for the single child.
+        assert_eq!(
+            outcomes.len(),
+            1,
+            "expected 1 clock sync outcome, got {}",
+            outcomes.len()
+        );
+        assert!(
+            matches!(&outcomes[0], ClockSyncOutcome::Synced { child_index: 0 }),
+            "expected Synced{{child_index: 0}}, got {:?}",
+            outcomes[0]
         );
 
         // Step 4: Verify the guest clock is now correct (close to host
