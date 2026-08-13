@@ -1367,7 +1367,7 @@ async fn create_sandbox(
         Err(e) => return server_error(&format!("blocking task panicked: {e}")),
     };
     if prewarm_requested {
-        let clock_failures: Vec<&str> = fork_result
+        let clock_failures: Vec<String> = fork_result
             .clock_sync_outcomes
             .iter()
             .filter_map(|o| match o {

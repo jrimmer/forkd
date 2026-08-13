@@ -953,7 +953,7 @@ fn sync_guest_clocks(children: &[Vm]) -> (u128, Vec<ClockSyncOutcome>) {
     let start = Instant::now();
 
     let mut handles = Vec::with_capacity(children.len());
-    for (_child_index, child) in children.iter().enumerate() {
+    for child in children.iter() {
         let netns = child.netns.clone();
         handles.push(thread::spawn(move || -> Result<()> {
             let addr = GUEST_AGENT_ADDR.to_string();
@@ -2488,6 +2488,53 @@ mod tests {
     }
 
     #[test]
+    fn fork_opts_sync_guest_clocks_defaults_disabled() {
+        // Clock sync is opt-in. The default must keep it disabled so
+        // custom/no-agent snapshots don't add the ~10s agent-poll
+        // latency to every restore — the "no added latency by default"
+        // guarantee for images without forkd-agent.
+        assert!(
+            !ForkOpts::default().sync_guest_clocks,
+            "sync_guest_clocks must default to false (opt-in)"
+        );
+    }
+
+    #[test]
+    fn restore_many_with_rejects_multi_child_shared_ip() {
+        // n>1 with per_child_netns=false means all children share the
+        // guest agent address 10.42.0.2:8888 and MAC, so per-child
+        // addressing is impossible. restore_many_with must reject this
+        // BEFORE spawning any Firecracker process or touching the
+        // filesystem. This exercises the multi-child address/mode guard
+        // the reviewer asked to cover.
+        let snap = Snapshot {
+            vmstate: "/nonexistent/vmstate.bin".into(),
+            memory: "/nonexistent/memory.bin".into(),
+            volumes: Vec::new(),
+            parent_tag: None,
+            parent_content_hash: None,
+            rootfs: None,
+        };
+        let opts = ForkOpts {
+            n: 2,
+            per_child_netns: false,
+            ..ForkOpts::default()
+        };
+        let err = snap
+            .restore_many_with(opts, Path::new("/nonexistent/forkd-test-workdir"))
+            .expect_err("n>1 with per_child_netns=false must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("per_child_netns=false"),
+            "error should name the per_child_netns=false mode, got: {msg}"
+        );
+        assert!(
+            msg.contains("n>1"),
+            "error should name the multi-child condition, got: {msg}"
+        );
+    }
+
+    #[test]
     fn snapshot_serializes_round_trip() {
         let s = Snapshot {
             vmstate: "/tmp/v".into(),
@@ -3015,6 +3062,7 @@ mod tests {
             prewarm_scratch_dir: None,
             memory_backend: MemoryBackend::File,
             enable_diff_snapshots: false,
+            sync_guest_clocks: false,
         };
 
         let fork_result = snapshot
@@ -3182,8 +3230,8 @@ mod tests {
 
         // Verify a Vec of outcomes can be filtered for failures
         // (the pattern callers use to decide fail-closed).
-        let outcomes = vec![synced, failed];
-        let failures: Vec<&str> = outcomes
+        let outcomes = [synced, failed];
+        let failures: Vec<String> = outcomes
             .iter()
             .filter_map(|o| match o {
                 ClockSyncOutcome::Failed { child_index, error } => {
@@ -3194,14 +3242,6 @@ mod tests {
             .collect();
         assert_eq!(failures.len(), 1);
         assert!(failures[0].contains("agent timeout"));
-    }
-
-    // RAII guard: removes work_dir on drop, even on panic.
-    struct WorkDirGuard(std::path::PathBuf);
-    impl Drop for WorkDirGuard {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
     }
 
     /// Integration test: sync_guest_clocks corrects a deliberately-wrong
@@ -3355,6 +3395,104 @@ mod tests {
 
         // Vm::drop kills firecracker and removes the socket.
         // WorkDirGuard drops work_dir.
+        drop(vm);
+    }
+
+    /// Integration test: sync_guest_clocks handles a delayed agent and
+    /// captures a FRESH timestamp. Unlike `sync_guest_clocks_corrects_wrong_clock`
+    /// (which waits for the agent first), this test calls sync_guest_clocks
+    /// immediately after boot — the agent is not yet listening, so the
+    /// function must poll for it. The timestamp is captured AFTER ping
+    /// succeeds, so the final guest clock must match the host wall time
+    /// closely (within a few seconds), NOT be stale by the poll duration.
+    ///
+    /// If the timestamp were captured before polling (the old behavior),
+    /// a multi-second agent startup would leave the guest clock that many
+    /// seconds in the past.
+    #[test]
+    #[ignore = "requires Linux + KVM + firecracker + rootfs image"]
+    #[cfg(target_os = "linux")]
+    fn sync_guest_clocks_delayed_agent_readiness() {
+        let kernel = std::env::var("FORKD_TEST_KERNEL")
+            .unwrap_or_else(|_| "/var/lib/forkd/kernels/vmlinux".to_string());
+        let rootfs = std::env::var("FORKD_TEST_ROOTFS")
+            .expect("FORKD_TEST_ROOTFS must point to an ext4 rootfs image");
+
+        assert!(
+            std::path::Path::new(&kernel).exists(),
+            "FORKD_TEST_KERNEL not found at {kernel}"
+        );
+        assert!(
+            std::path::Path::new(&rootfs).exists(),
+            "FORKD_TEST_ROOTFS not found at {rootfs}"
+        );
+
+        let work_dir =
+            std::env::temp_dir().join(format!("forkd-clocksync-delayed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&work_dir);
+        let _work_dir_guard = WorkDirGuard(work_dir.clone());
+
+        let addr = GUEST_AGENT_ADDR.to_string();
+        assert!(
+            ping_at(&addr).is_err(),
+            "{addr} is already reachable — a stale VM may occupy the address; \
+             kill it before running this test"
+        );
+
+        let cfg = BootConfig::ext4_rw(kernel.into(), rootfs.into(), work_dir.clone())
+            .with_network(NetworkConfig::default_tap("forkd-tap0"));
+
+        let vm = Vm::boot(&cfg).expect("boot VM");
+
+        // Deliberately do NOT pre-wait for the agent. Call sync_guest_clocks
+        // immediately so it must poll for a not-yet-ready agent. This is the
+        // "delayed agent readiness" scenario.
+        let (elapsed_ms, outcomes) = sync_guest_clocks(std::slice::from_ref(&vm));
+        assert!(
+            elapsed_ms < 30_000,
+            "sync_guest_clocks took {elapsed_ms}ms, expected < 30s"
+        );
+        assert_eq!(
+            outcomes.len(),
+            1,
+            "expected 1 clock sync outcome, got {}",
+            outcomes.len()
+        );
+        assert!(
+            matches!(&outcomes[0], ClockSyncOutcome::Synced { child_index: 0 }),
+            "expected Synced{{child_index: 0}}, got {:?}",
+            outcomes[0]
+        );
+
+        // The key assertion: the guest clock must match host wall time
+        // CLOSELY. A fresh timestamp (captured after ping) yields near-zero
+        // drift; a stale timestamp (captured before the poll) would drift by
+        // however long the agent took to come up.
+        let host_time = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("host time before epoch")
+            .as_secs();
+
+        let fixed_resp = exec_at(
+            &addr,
+            vec!["date".into(), "-u".into(), "+%s".into()],
+            Duration::from_secs(10),
+        )
+        .expect("exec date to read synced clock");
+        let fixed_time: u64 = fixed_resp
+            .stdout
+            .trim()
+            .parse()
+            .expect("parse synced guest time");
+
+        let drift = host_time.abs_diff(fixed_time);
+        assert!(
+            drift <= 3,
+            "guest clock drifts {drift}s from host after sync_guest_clocks \
+             (host={host_time}, guest={fixed_time}) — the timestamp must be \
+             captured fresh after ping, not before the poll"
+        );
+
         drop(vm);
     }
 }
