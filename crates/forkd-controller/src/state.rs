@@ -987,4 +987,69 @@ mod tests {
         // With 0 kill_failed, startup should NOT abort (baseline).
         assert!(result.kill_failed == 0, "baseline should not abort");
     }
+
+    /// Regression: check_orphan_kill_result must return Err when
+    /// kill_failed > 0, proving that run_daemon aborts startup and
+    /// no conflicting spawns can be admitted. This is the actual
+    /// abort-decision test — the previous test only verified the
+    /// zero-baseline contract.
+    #[test]
+    fn check_orphan_kill_result_aborts_on_kill_failure() {
+        use crate::check_orphan_kill_result;
+
+        // kill_failed > 0 must abort (EPERM, D-state timeout, etc.)
+        let result = KillOrphansResult {
+            killed: 2,
+            pruned_stale: 0,
+            kill_failed: 1,
+        };
+        let outcome = check_orphan_kill_result(&result);
+        assert!(
+            outcome.is_err(),
+            "kill_failed=1 must cause startup abort, got {outcome:?}"
+        );
+        let err = outcome.unwrap_err().to_string();
+        assert!(
+            err.contains("aborting startup"),
+            "error should mention aborting startup, got: {err}"
+        );
+        assert!(
+            err.contains('1'),
+            "error should contain kill_failed count, got: {err}"
+        );
+
+        // kill_failed == 0 must NOT abort, even with killed/pruned entries
+        let result = KillOrphansResult {
+            killed: 5,
+            pruned_stale: 3,
+            kill_failed: 0,
+        };
+        assert!(
+            check_orphan_kill_result(&result).is_ok(),
+            "kill_failed=0 should not abort even with killed/pruned entries"
+        );
+    }
+
+    /// Regression: check_orphan_kill_result error message must
+    /// contain the exact kill_failed count so operators can identify
+    /// how many orphans need manual intervention.
+    #[test]
+    fn check_orphan_kill_result_error_contains_count() {
+        use crate::check_orphan_kill_result;
+
+        let result = KillOrphansResult {
+            killed: 0,
+            pruned_stale: 0,
+            kill_failed: 3,
+        };
+        let err = check_orphan_kill_result(&result).unwrap_err().to_string();
+        assert!(
+            err.contains('3'),
+            "error should contain kill_failed count (3), got: {err}"
+        );
+        assert!(
+            err.contains("could not be killed"),
+            "error should explain the failure, got: {err}"
+        );
+    }
 }

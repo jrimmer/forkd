@@ -80,6 +80,25 @@ fn unauthenticated_non_loopback(bind: SocketAddr, token_file: Option<&Path>) -> 
     token_file.is_none() && !bind.ip().is_loopback()
 }
 
+/// Post-`kill_orphans` startup decision: abort if any orphan could
+/// not be killed (EPERM, D-state timeout, etc.). The NetnsAllocator
+/// active set and `shared_tap_owner` start empty, so a new spawn could
+/// reuse the still-alive orphan's netns index or tap lease — the exact
+/// collision #298 is meant to prevent. Returning `Err` here causes
+/// `run_daemon` to exit before binding the HTTP listener, so no spawns
+/// can be admitted.
+pub(crate) fn check_orphan_kill_result(orphans: &crate::state::KillOrphansResult) -> Result<()> {
+    if orphans.kill_failed > 0 {
+        anyhow::bail!(
+            "aborting startup: {} orphaned Firecracker process(es) could not be killed \
+             (EPERM or did not exit within timeout); refusing to accept spawns that may \
+             collide with still-alive orphans. Kill them manually and restart.",
+            orphans.kill_failed
+        );
+    }
+    Ok(())
+}
+
 /// Bring up the controller daemon. Blocks until the listener exits.
 /// SIGTERM and SIGINT trigger a graceful shutdown; SIGHUP reopens the
 /// configured audit log after external rotation.
@@ -120,14 +139,7 @@ pub async fn run_daemon(cfg: DaemonConfig) -> Result<()> {
     // index or tap lease — the exact collision #298 is meant to prevent.
     // Abort startup so the operator intervenes rather than silently
     // admitting conflicting spawns. (review #299)
-    if orphans.kill_failed > 0 {
-        anyhow::bail!(
-            "aborting startup: {} orphaned Firecracker process(es) could not be killed \
-             (EPERM or did not exit within timeout); refusing to accept spawns that may \
-             collide with still-alive orphans. Kill them manually and restart.",
-            orphans.kill_failed
-        );
-    }
+    check_orphan_kill_result(&orphans)?;
 
     let audit = AuditSink::open(&cfg.audit_log)
         .with_context(|| format!("open audit log {}", cfg.audit_log.display()))?;
