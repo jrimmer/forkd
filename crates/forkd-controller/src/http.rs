@@ -1468,6 +1468,12 @@ async fn create_sandbox(
                     } else {
                         last_err = Some(e);
                     }
+                    tracing::warn!(
+                        attempt = attempt + 1,
+                        next_backoff_ms = backoffs_ms[attempt],
+                        error = %e,
+                        "restore_many: tap/cgroup busy, retrying"
+                    );
                 }
             }
         }
