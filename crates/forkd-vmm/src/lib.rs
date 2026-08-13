@@ -776,6 +776,7 @@ pub fn ping_at(addr: &str) -> Result<serde_json::Value> {
 /// Used by tests to determine whether KVM_CLOCK_REALTIME is available
 /// (needs kernel ≥ 5.16). Returns `None` if `/proc/sys/kernel/osrelease`
 /// cannot be read (non-Linux).
+#[cfg(test)]
 fn host_kernel_release() -> Option<String> {
     #[cfg(target_os = "linux")]
     {
@@ -794,6 +795,7 @@ fn host_kernel_release() -> Option<String> {
 /// On x86 this makes kvm-clock auto-correct to host wall time on
 /// snapshot restore; on older kernels the restored kvm-clock stays
 /// stale and needs a complementary guest-side correction (PR #300).
+#[cfg(test)]
 fn kernel_supports_kvm_clock_realtime(release: &str) -> bool {
     // Parse the first two numeric components of the release string.
     let parts: Vec<&str> = release.split('.').collect();
