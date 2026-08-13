@@ -150,8 +150,23 @@ $SUDO chroot "$WORK" /bin/bash -c "passwd -d root 2>/dev/null || true"
 
 # ----------------------------------------------------------------------------
 say "[5/5] building ext4 image ($SIZE_MB MiB)..."
-dd if=/dev/zero of="$OUTPUT" bs=1M count="$SIZE_MB" status=progress 2>&1 | tail -1
-mkfs.ext4 -q -F -L forkd-rootfs -d "$WORK" "$OUTPUT"
+# Build a sparse ext4 file. Use truncate (not dd) so the file is
+# sparse — physical disk usage is proportional to actual written
+# content, not the nominal size. This lets us use a generous default
+# size (24 GiB) for engineering workloads without wasting disk on
+# ephemeral function-call sandboxes.
+#
+# Build to a temporary sibling then atomically rename on success, so
+# a failed mkfs does not destroy a prior cache artifact: truncate -s
+# in-place on an existing fully-allocated file does not release its
+# blocks, and if mkfs fails the old file is already corrupted.
+TMP_OUTPUT="${OUTPUT}.tmp.$$"
+truncate -s "${SIZE_MB}M" "$TMP_OUTPUT"
+if ! mkfs.ext4 -q -F -L forkd-rootfs -d "$WORK" "$TMP_OUTPUT"; then
+    rm -f "$TMP_OUTPUT"
+    die "mkfs.ext4 failed"
+fi
+mv "$TMP_OUTPUT" "$OUTPUT"
 ls -lh "$OUTPUT"
 
 echo

@@ -44,7 +44,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs::File;
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::time::Instant;
 
@@ -958,8 +958,35 @@ pub fn place_rootfs_sidecar(src: &Path, dst: &Path, expected_sha: &str) -> Resul
         let input = File::open(src).with_context(|| format!("open sidecar {}", src.display()))?;
         let mut dec = zstd::Decoder::new(input).context("init zstd decoder on sidecar")?;
         let mut out = File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
-        io::copy(&mut dec, &mut out)
-            .with_context(|| format!("decompress sidecar to {}", tmp.display()))?;
+        // Sparse-aware decompression: instead of io::copy (which writes
+        // every byte including zeroes, producing a fully-allocated file),
+        // read in chunks and seek past zero blocks to create sparse holes.
+        // This preserves sparse ext4 extents through the pack/pull sidecar
+        // round-trip. A 24 GiB rootfs with 2 GiB of actual content
+        // decompresses to a 2 GiB physical file.
+        const CHUNK_SIZE: usize = 65536; // 64 KiB
+        let mut total_written: u64 = 0;
+        let mut buf = vec![0u8; CHUNK_SIZE];
+        loop {
+            let n = dec.read(&mut buf).context("read decompressed chunk")?;
+            if n == 0 {
+                break;
+            }
+            if buf[..n].iter().all(|&b| b == 0) {
+                // Zero block — seek forward (creates a sparse hole).
+                out.seek(SeekFrom::Current(n as i64))
+                    .with_context(|| format!("seek past zero block in {}", tmp.display()))?;
+            } else {
+                out.write_all(&buf[..n])
+                    .with_context(|| format!("write chunk to {}", tmp.display()))?;
+            }
+            total_written += n as u64;
+        }
+        // Ensure the file length accounts for any trailing zero blocks
+        // (seek-past-EOF extends the file logically but we must set the
+        // final length explicitly).
+        out.set_len(total_written)
+            .with_context(|| format!("set final length on {}", tmp.display()))?;
     }
     let actual = sha256_file(&tmp)?;
     if !actual.eq_ignore_ascii_case(expected_sha) {
@@ -1514,5 +1541,78 @@ mod tests {
             msg.contains("unsafe tag"),
             "error must name the unsafe-tag refusal: {msg}"
         );
+    }
+
+    /// Regression: place_rootfs_sidecar must preserve sparse ext4
+    /// extents through the pack/pull round-trip. A fully-allocated
+    /// decompression defeats the purpose of sparse rootfs (a 24 GiB
+    /// logical file would consume 24 GiB of physical disk). This test
+    /// creates a synthetic sparse file, compresses it to a sidecar,
+    /// decompresses with place_rootfs_sidecar, and verifies:
+    /// 1. SHA-256 matches (content integrity)
+    /// 2. Logical size matches (no truncation)
+    /// 3. Physical blocks < logical size (sparseness preserved)
+    #[test]
+    fn place_rootfs_sidecar_preserves_sparse_extents() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+
+        // Create a 6 MiB sparse file: 1 MiB 0xAA + 4 MiB hole + 1 MiB 0xBB
+        let sparse_src = dir.join("sparse.src");
+        {
+            use std::io::{Seek, SeekFrom, Write};
+            let mut f = std::fs::File::create(&sparse_src).unwrap();
+            // Write 1 MiB of 0xAA
+            f.write_all(&vec![0xAA; 1024 * 1024]).unwrap();
+            // Seek forward 4 MiB (creates a sparse hole)
+            f.seek(SeekFrom::Start(5 * 1024 * 1024)).unwrap();
+            // Write 1 MiB of 0xBB at the end
+            f.write_all(&vec![0xBB; 1024 * 1024]).unwrap();
+            f.flush().unwrap();
+        }
+
+        // Compress to sidecar
+        let sidecar = dir.join("sparse.sidecar");
+        compress_file(&sparse_src, &sidecar, 3).expect("compress");
+
+        // Compute expected SHA-256 of the original sparse file
+        let expected_sha = sha256_file(&sparse_src).expect("sha256 original");
+
+        // Decompress with place_rootfs_sidecar
+        let out = dir.join("sparse.out.ext4");
+        place_rootfs_sidecar(&sidecar, &out, &expected_sha).expect("place_rootfs_sidecar");
+
+        // 1. SHA-256 must match (content integrity)
+        let actual_sha = sha256_file(&out).expect("sha256 output");
+        assert_eq!(
+            actual_sha, expected_sha,
+            "SHA-256 mismatch: sparse extents lost content"
+        );
+
+        // 2. Logical size must match
+        let src_meta = std::fs::metadata(&sparse_src).unwrap();
+        let out_meta = std::fs::metadata(&out).unwrap();
+        assert_eq!(
+            src_meta.len(),
+            out_meta.len(),
+            "logical size mismatch: src={}, out={}",
+            src_meta.len(),
+            out_meta.len()
+        );
+
+        // 3. Physical blocks must be less than logical size (sparseness)
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::linux::fs::MetadataExt;
+            let physical = out_meta.st_blocks() * 512;
+            let logical = out_meta.len();
+            assert!(
+                physical < logical,
+                "file is not sparse: physical={} logical={} — \
+                 sparse extents were not preserved",
+                physical,
+                logical
+            );
+        }
     }
 }

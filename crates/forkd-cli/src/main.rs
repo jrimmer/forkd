@@ -331,7 +331,7 @@ enum Cmd {
         #[arg(long)]
         extra: Vec<String>,
         /// Rootfs size in MiB.
-        #[arg(long, default_value_t = 1536)]
+        #[arg(long, default_value_t = DEFAULT_ROOTFS_SIZE_MIB)]
         size_mib: u32,
         /// Cache directory for built rootfs artifacts (so re-running
         /// with the same image skips the Docker → ext4 step).
@@ -718,8 +718,8 @@ enum ParentAction {
         /// Output ext4 file (default: `./<image-slug>.ext4`).
         #[arg(long, short)]
         output: Option<PathBuf>,
-        /// Image size in MiB (default 1536).
-        #[arg(long, default_value_t = 1536)]
+        /// Image size in MiB (default 24576, sparse).
+        #[arg(long, default_value_t = DEFAULT_ROOTFS_SIZE_MIB)]
         size_mib: u32,
         /// Extra apt packages to install on top of the base image.
         #[arg(long)]
@@ -1501,6 +1501,14 @@ fn unpack_chain_into(
 const DEFAULT_HUB_REGISTRY_URL: &str =
     "https://raw.githubusercontent.com/deeplethe/forkd/main/registry.json";
 
+/// Default rootfs image size in MiB. With sparse ext4 files (build-rootfs.sh
+/// uses `truncate`, not `dd`), physical disk usage is proportional to
+/// actual written content, so a generous nominal default is safe: a 24 GiB
+/// rootfs with 2 GiB of content consumes only ~2 GiB of disk. This eliminates
+/// the tradeoff between engineering workloads (need large disk for
+/// compilation) and ephemeral sandboxes (waste space with large rootfs).
+const DEFAULT_ROOTFS_SIZE_MIB: u32 = 24576;
+
 #[derive(serde::Deserialize)]
 struct Registry {
     #[allow(dead_code)]
@@ -2212,7 +2220,7 @@ fn run_cmd(
 
     // 1. Materialize the rootfs (cached). Cache key includes size + extras.
     std::fs::create_dir_all(&cache).ok();
-    let rootfs = cache.join(rootfs_cache_key(&image, 1536, &extra));
+    let rootfs = cache.join(rootfs_cache_key(&image, DEFAULT_ROOTFS_SIZE_MIB, &extra));
     if !rootfs.exists() {
         eprintln!(
             "==> building rootfs for {image} (cached at {})",
