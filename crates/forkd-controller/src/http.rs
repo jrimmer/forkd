@@ -1416,10 +1416,14 @@ impl VmNetnsGuard {
     /// Take the VM out of the guard without releasing the netns index.
     /// Call this when transferring ownership to live_vms (the index
     /// stays ACTIVE until the VM is later deleted/suspended).
+    ///
+    /// The guard then drops normally — its remaining fields (the
+    /// `Arc<NetnsAllocator>` and bookkeeping strings) are released
+    /// without leaking. `Drop` checks `self.vm.is_some()` so the netns
+    /// index is NOT released when the VM was already taken out here.
     fn into_vm(mut self) -> forkd_vmm::Vm {
-        let vm = self.vm.take().expect("guard already consumed");
-        std::mem::forget(self); // prevent Drop from running
-        vm
+        self.vm.take().expect("guard already consumed")
+        // self drops here; Drop sees vm == None and skips kill+release.
     }
 }
 
@@ -1436,14 +1440,37 @@ impl std::ops::DerefMut for VmNetnsGuard {
     }
 }
 
+#[cfg(test)]
+impl VmNetnsGuard {
+    /// Construct a guard in the post-`into_vm()` state: the VM has
+    /// already been taken out, but the bookkeeping fields (the
+    /// `Arc<NetnsAllocator>` and netns index) remain. This lets tests
+    /// verify that dropping such a guard releases the Arc reference
+    /// without leaking — the regression for the `mem::forget` bug.
+    fn test_consumed(alloc: std::sync::Arc<crate::netns::NetnsAllocator>) -> Self {
+        Self {
+            vm: None,
+            netns_index: Some(1),
+            alloc,
+        }
+    }
+}
+
 impl Drop for VmNetnsGuard {
     fn drop(&mut self) {
-        // Vm::drop kills firecracker + cleans cgroup
-        self.vm.take();
-        // Release the netns index after the VM is killed
-        if let Some(idx) = self.netns_index {
-            self.alloc.release_index(idx);
+        // Only kill the VM and release the netns index when the guard
+        // still owns the VM. If `into_vm()` was called, `self.vm` is
+        // `None` — the VM was transferred to `live_vms` and the index
+        // must stay ACTIVE until that VM is later deleted/suspended.
+        if self.vm.is_some() {
+            // Vm::drop kills firecracker + cleans cgroup
+            self.vm.take();
+            if let Some(idx) = self.netns_index {
+                self.alloc.release_index(idx);
+            }
         }
+        // The Arc<NetnsAllocator> (and other bookkeeping fields) drop
+        // normally, decrementing refcounts. No leak.
     }
 }
 
@@ -4426,5 +4453,36 @@ mod tests {
         a.release_index(1);
         // Index is back in the available pool
         assert!(a.reserve(1).is_some(), "index reusable after release");
+    }
+
+    /// Regression for the `mem::forget` leak in `VmNetnsGuard::into_vm()`.
+    /// The old implementation called `std::mem::forget(self)` after taking
+    /// the VM, permanently leaking the guard's `Arc<NetnsAllocator>` on
+    /// every successful BRANCH reinsertion. The fix lets the guard drop
+    /// normally after `into_vm()` takes the VM out (Drop sees `vm == None`
+    /// and skips kill+release). This test verifies the Arc strong count
+    /// returns to baseline after the consumed guard is dropped — if the
+    /// guard leaked the Arc, the count would stay elevated.
+    #[test]
+    fn vmnetnsguard_into_vm_does_not_leak_arc() {
+        let alloc =
+            crate::netns::NetnsAllocator::new(8, Box::new(crate::netns::RangeProbe { max: 8 }));
+        // Baseline: only the test's own reference.
+        let baseline = std::sync::Arc::strong_count(&alloc);
+
+        // Simulate repeated BRANCH reinsertions: each iteration creates
+        // a consumed guard (the post-`into_vm()` state) and drops it.
+        // If each drop leaked the Arc, the strong count would grow
+        // by N after N iterations. With the fix, it returns to baseline.
+        for _ in 0..50 {
+            let consumed = VmNetnsGuard::test_consumed(std::sync::Arc::clone(&alloc));
+            drop(consumed);
+        }
+        assert_eq!(
+            std::sync::Arc::strong_count(&alloc),
+            baseline,
+            "Arc strong count elevated after 50 consumed-guard drops — \
+             into_vm() is leaking the allocator Arc"
+        );
     }
 }
