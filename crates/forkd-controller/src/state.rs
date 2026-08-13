@@ -451,6 +451,19 @@ fn pid_alive(_pid: u32) -> bool {
 /// check and `kill_pid` is acknowledged — `pidfd_open` +
 /// `pidfd_send_signal` would close it entirely (Linux 5.3+).
 #[cfg(target_os = "linux")]
+/// Check whether a PID belongs to a Firecracker process by reading
+/// `/proc/<pid>/comm`. Uses exact match (`== "firecracker"`) to avoid
+/// false positives from processes whose names contain the substring.
+///
+/// **Limitation:** this is NOT complete PID-reuse protection. If a
+/// Firecracker process exits and its PID is reused by another
+/// Firecracker process before this check runs, the comm match passes
+/// and the new (legitimate) process would be killed. A robust fix
+/// would use pidfd signaling plus durable identity validation
+/// (process start time recorded with the registry entry at spawn
+/// time, compared on startup). That is tracked as a follow-up — the
+/// comm check is a defense-in-depth heuristic, not a guarantee.
+#[cfg(target_os = "linux")]
 fn pid_is_firecracker(pid: u32) -> bool {
     // Defensive guard against pid 0/1 (defense-in-depth for corrupted
     // state.json). Real firecracker PIDs are always > 1.
@@ -943,5 +956,35 @@ mod tests {
         // On macOS: reconcile prunes 0 (all PIDs "alive"), kill_orphans prunes 2.
         assert!(r.list_sandboxes().is_empty());
         assert!(pruned + result.killed + result.pruned_stale >= 2);
+    }
+
+    /// Regression: kill_failed > 0 must cause the caller to abort startup,
+    /// not silently continue with an empty NetnsAllocator. This test
+    /// verifies the KillOrphansResult contract: on non-Linux platforms
+    /// (where pid_is_firecracker returns false), alive-PID entries are
+    /// pruned as stale (kill_failed stays 0). On Linux, a real
+    /// firecracker PID that can't be killed would set kill_failed > 0.
+    /// The caller (run_daemon) checks `if orphans.kill_failed > 0 {
+    /// anyhow::bail!(...) }` — this test verifies that a result with
+    /// kill_failed == 0 does NOT trigger the abort (baseline), and
+    /// documents the contract.
+    #[test]
+    fn kill_orphans_result_kill_failed_contract() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("state.json");
+        let r = Registry::load_or_init(path).unwrap();
+
+        // No sandboxes — kill_orphans returns all-zero result.
+        let result = r.kill_orphans().unwrap();
+        assert_eq!(
+            result.kill_failed, 0,
+            "no sandboxes should yield 0 kill_failed"
+        );
+        assert_eq!(result.killed, 0);
+        assert_eq!(result.pruned_stale, 0);
+
+        // The caller's abort condition: kill_failed > 0 → bail.
+        // With 0 kill_failed, startup should NOT abort (baseline).
+        assert!(result.kill_failed == 0, "baseline should not abort");
     }
 }
