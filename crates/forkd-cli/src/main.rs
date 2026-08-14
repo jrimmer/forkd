@@ -2506,13 +2506,50 @@ fn snapshot_cmd(
             .and_then(|s| s.to_str())
             .is_some_and(|s| s == "ext4");
 
-    let work_dir = std::env::temp_dir().join(format!("forkd-parent-{tag}"));
-    let mut cfg = if rw {
-        eprintln!("    rootfs mode: read-write (ext4)");
-        BootConfig::ext4_rw(kernel, rootfs, work_dir.clone())
+    // Immutable-baseline rootfs cloning (issue #296):
+    //
+    // For ext4 (read-write) rootfs, the original file is the immutable
+    // baseline — it is NEVER mounted read-write. Before booting, we
+    // create a reflink copy (instant on btrfs/xfs via FICLONE, falls
+    // back to full copy on other filesystems) in the snapshot directory.
+    // The VM boots from the clone and writes to it; the baseline stays
+    // clean. After the VM is killed, the clone persists as the
+    // snapshot's rootfs (needed for restores — Firecracker re-opens the
+    // rootfs from the path stored in the vmstate).
+    //
+    // This eliminates the dirty-journal corruption that e2fsck-on-boot
+    // was working around: since the baseline is never written to, it
+    // never has uncommitted journal transactions or dirty metadata.
+    let snap_dir = snapshot_dir(&tag);
+    let boot_rootfs = if rw {
+        std::fs::create_dir_all(&snap_dir).context("create snapshot dir for rootfs clone")?;
+        let clone_path = snap_dir.join("rootfs.ext4");
+        // Remove any stale clone from a previous (failed) run.
+        let _ = std::fs::remove_file(&clone_path);
+        eprintln!("    rootfs mode: read-write (ext4, immutable baseline clone)");
+        eprintln!(
+            "    cloning rootfs {} → {} (reflink preferred)...",
+            rootfs.display(),
+            clone_path.display()
+        );
+        forkd_vmm::chain::reflink_copy(&rootfs, &clone_path).with_context(|| {
+            format!(
+                "clone rootfs {} → {}",
+                rootfs.display(),
+                clone_path.display()
+            )
+        })?;
+        clone_path
     } else {
         eprintln!("    rootfs mode: read-only (squashfs)");
-        BootConfig::quickstart(kernel, rootfs, work_dir.clone())
+        rootfs
+    };
+
+    let work_dir = std::env::temp_dir().join(format!("forkd-parent-{tag}"));
+    let mut cfg = if rw {
+        BootConfig::ext4_rw(kernel, boot_rootfs, work_dir.clone())
+    } else {
+        BootConfig::quickstart(kernel, boot_rootfs, work_dir.clone())
     };
     if let Some(mib) = mem_size_mib {
         eprintln!("    memory: {mib} MiB (override; default is 512)");
@@ -2556,8 +2593,7 @@ fn snapshot_cmd(
     eprintln!("==> pausing...");
     vm.pause().context("pause parent")?;
 
-    let snap_dir = snapshot_dir(&tag);
-    std::fs::create_dir_all(&snap_dir).context("create snapshot dir")?;
+    // snap_dir was created earlier for the rootfs clone.
     let vmstate = snap_dir.join("vmstate");
     let memory = snap_dir.join("memory.bin");
 
