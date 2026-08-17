@@ -235,9 +235,21 @@ pub fn pack(
         });
     }
 
-    // #242: ship the rootfs as a content-addressed sidecar next to the
-    // pack (it lives outside the snap dir, so it isn't in `files`).
+    // #242 / review #295 r6: ship the rootfs as a content-addressed
+    // `.rootfs.zst` sidecar next to the pack — the SINGLE portable
+    // rootfs transport. Returns `Ok(None)` (with a warning) when the
+    // snapshot records no rootfs or the file is missing; in that case
+    // the pack is produced without a portable rootfs and will only
+    // restore on the packing host.
     let rootfs = emit_rootfs_sidecar(snap_dir, out_path)?;
+    // When a portable sidecar was emitted, exclude rootfs.ext4 from the
+    // tar body (it's already counted in `files` for manifest integrity).
+    // The tar append loop below skips any entry whose path equals the
+    // rootfs filename when a sidecar is present.
+    let rootfs_filename: Option<String> = rootfs
+        .as_ref()
+        .and_then(|r| Path::new(&r.target_path).file_name())
+        .map(|s| s.to_string_lossy().into_owned());;
 
     let manifest = Manifest {
         forkd_pack_version: PACK_FORMAT_VERSION_V1,
@@ -276,6 +288,14 @@ pub fn pack(
         .context("append manifest.toml")?;
 
     for entry in &files {
+        // Review #295 r6 blocker 3: don't tar the rootfs when a portable
+        // sidecar was emitted — the sidecar is the single transport and
+        // tar'd rootfs.ext4 would just duplicate a huge image.
+        if let Some(ref rf) = rootfs_filename {
+            if entry.path == *rf {
+                continue;
+            }
+        }
         let path = snap_dir.join(&entry.path);
         let mut f = File::open(&path).with_context(|| format!("open {}", path.display()))?;
         tar.append_file(&entry.path, &mut f)
@@ -928,7 +948,18 @@ fn emit_rootfs_sidecar(snap_dir: &Path, pack_path: &Path) -> Result<Option<Rootf
     }
 
     Ok(Some(RootfsRef {
-        target_path: rootfs_path.to_string_lossy().into_owned(),
+        // Review #295 r6 blocker 3: target_path is the PORTABLE,
+        // host-independent location the puller places the rootfs at —
+        // a path RELATIVE to the snapshot dir ("rootfs.ext4"), not the
+        // packing host's absolute path. The puller resolves it against
+        // its own snapshot dir so the same pack restores on any host
+        // regardless of where the packer kept its cache/snapshots.
+        // The content address is the sha256 (the sidecar name + the
+        // integrity check); target_path is only the in-snap-dir filename.
+        target_path: rootfs_path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| rootfs_path.to_string_lossy().into_owned()),
         sha256: sha,
         size,
     }))
