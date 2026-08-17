@@ -1124,10 +1124,7 @@ fn sync_one_child_clock(
             break;
         }
         if Instant::now() >= deadline {
-            bail!(
-                "did not respond within {}s",
-                timeout.as_secs()
-            );
+            bail!("did not respond within {}s", timeout.as_secs());
         }
         thread::sleep(Duration::from_millis(200));
     }
@@ -3714,9 +3711,7 @@ mod tests {
         };
 
         // Clock-setter always fails.
-        let set_clock = |_ts: u64| {
-            bail!("date -s exited with 1: operation not permitted")
-        };
+        let set_clock = |_ts: u64| bail!("date -s exited with 1: operation not permitted");
 
         let result = sync_one_child_clock(ping, now, set_clock, CLOCK_SYNC_AGENT_TIMEOUT);
 
