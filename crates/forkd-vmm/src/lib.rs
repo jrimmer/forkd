@@ -432,6 +432,140 @@ impl Vm {
     }
 }
 
+/// A firecracker process found on the host that may interfere with a
+/// restore (holding a tap device fd, a netns slot, or consuming fd/RAM
+/// budget). Returned by [`scan_firecracker_orphans`].
+#[derive(Debug, Clone)]
+pub struct OrphanProcess {
+    pub pid: u32,
+    /// Elapsed seconds since the process started (best-effort, from
+    /// `/proc/<pid>/stat` start time). 0 when unavailable.
+    pub elapsed_secs: u64,
+    /// The command line (best-effort, from `/proc/<pid>/cmdline`).
+    /// Empty when unreadable.
+    pub cmdline: String,
+}
+
+/// Scan `/proc` for running firecracker processes whose PIDs are NOT in
+/// the `known_pids` set. These are potential orphans — processes from a
+/// prior (crashed) run that still hold tap devices, netns slots, or fd
+/// budget, and may doom a new `restore_many_with` to socket/restore
+/// failures. The caller (controller) passes the PIDs of every VM in
+/// `live_vms` so only untracked firecracker processes are reported.
+///
+/// This is a best-effort, read-only scan: it never kills anything. The
+/// controller logs the results before a restore so operators can see
+/// contention from orphans. The scan is one `/proc` readdir plus, for
+/// each firecracker PID found, reads of `/proc/<pid>/comm`,
+/// `/proc/<pid>/cmdline`, and `/proc/<pid>/stat` (via `proc_elapsed_secs`).
+/// Safe to call before every restore — the per-orphan I/O is bounded by
+/// the number of firecracker processes on the host (typically small).
+///
+/// TOCTOU note: the scan is a point-in-time observation. New firecracker
+/// processes may appear between scan and restore, and a known PID could
+/// be reused by a new process in that window. The scan is logging-only
+/// and never gates a restore, so this is acceptable, but operators should
+/// not treat the scan as a guarantee that no orphans exist at restore time.
+///
+/// Returns an empty vec on non-Linux platforms (no `/proc`).
+pub fn scan_firecracker_orphans(known_pids: &std::collections::HashSet<u32>) -> Vec<OrphanProcess> {
+    scan_firecracker_orphans_impl(known_pids)
+}
+
+#[cfg(target_os = "linux")]
+fn scan_firecracker_orphans_impl(
+    known_pids: &std::collections::HashSet<u32>,
+) -> Vec<OrphanProcess> {
+    let mut orphans = Vec::new();
+    let entries = match std::fs::read_dir("/proc") {
+        Ok(e) => e,
+        Err(_) => return orphans,
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_str = match name.to_str() {
+            Some(s) => s,
+            None => continue,
+        };
+        let pid: u32 = match name_str.parse() {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        if pid <= 1 || known_pids.contains(&pid) {
+            continue;
+        }
+        // `/proc/<pid>/comm` is the process's command name (truncated to
+        // 15 chars). For firecracker this is exactly "firecracker".
+        let comm = match std::fs::read_to_string(format!("/proc/{pid}/comm")) {
+            Ok(s) => s.trim().to_string(),
+            Err(_) => continue,
+        };
+        if comm != "firecracker" {
+            continue;
+        }
+        // Best-effort cmdline + elapsed. Failure here doesn't disqualify
+        // the orphan — we already confirmed it's a firecracker process.
+        let cmdline = std::fs::read_to_string(format!("/proc/{pid}/cmdline"))
+            .unwrap_or_default()
+            .replace('\0', " ")
+            .trim()
+            .to_string();
+        let elapsed_secs = proc_elapsed_secs(pid).unwrap_or(0);
+        orphans.push(OrphanProcess {
+            pid,
+            elapsed_secs,
+            cmdline,
+        });
+    }
+    orphans
+}
+
+/// Read `/proc/<pid>/stat` and compute elapsed seconds since process start.
+/// Returns 0 when the file is missing or unparseable (non-fatal).
+#[cfg(target_os = "linux")]
+fn proc_elapsed_secs(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // Field 22 is starttime in clock ticks since boot. The comm field (2)
+    // is parenthesized and may contain spaces, so split from the right.
+    let rparen = stat.rfind(')')?;
+    let rest = &stat[rparen + 1..];
+    let mut fields = rest.split_whitespace();
+    // Fields 3..=21 (state through itrealvalue) precede field 22 (starttime).
+    for _ in 0..19 {
+        fields.next();
+    }
+    let starttime_ticks: u64 = fields.next()?.parse().ok()?;
+    let start_secs = starttime_ticks / PROC_CLK_TCK;
+    let now = boot_relative_secs()?;
+    now.checked_sub(start_secs)
+}
+
+/// Clock ticks per second for `/proc/<pid>/stat` time fields. This is
+/// `USER_HZ` on Linux, which is 100 on every x86_64/aarch64 host forkd
+/// targets today. `libc::sysconf(libc::_SC_CLK_TCK)` could read it at
+/// runtime, but the value is effectively fixed across all supported
+/// kernels — hardcoding avoids a runtime probe for a constant.
+#[cfg(target_os = "linux")]
+const PROC_CLK_TCK: u64 = 100;
+
+/// Seconds since boot, from `/proc/uptime`. None when unreadable.
+#[cfg(target_os = "linux")]
+fn boot_relative_secs() -> Option<u64> {
+    let uptime = std::fs::read_to_string("/proc/uptime").ok()?;
+    let first = uptime.split_whitespace().next()?;
+    let secs: f64 = first.parse().ok()?;
+    Some(secs as u64)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn scan_firecracker_orphans_impl(
+    _known_pids: &std::collections::HashSet<u32>,
+) -> Vec<OrphanProcess> {
+    // No `/proc` on non-Linux — nothing to scan. This stub keeps the
+    // function callable from dev boxes (macOS) for test compilation.
+    Vec::new()
+}
+
 /// On-disk snapshot of a paused VM: a vmstate blob (vCPU + devices) plus a
 /// memory image file. Children restore from these by mmap'ing memory with
 /// `MAP_PRIVATE`, which the kernel implements as copy-on-write.
@@ -604,6 +738,15 @@ pub struct ForkOpts {
     /// Negligible relative to the snapshot-write savings on subsequent
     /// Diff snapshots.
     pub enable_diff_snapshots: bool,
+    /// Per-child timeout for waiting on a firecracker API socket to appear
+    /// after spawn, in seconds. The default of 10s matches the historical
+    /// hardcoded budget. Under contention from orphaned VMs, parallel restore
+    /// bursts, or slow tap/netns teardown, firecracker processes can take
+    /// longer than 10s to open their API socket; callers that expect heavy
+    /// load (e.g. the daemon's warm-pool refiller under spawn bursts) may
+    /// raise this to give each child more room rather than fail the whole
+    /// batch. Set to 0 to use the default. See `wait_for_sock`.
+    pub socket_wait_timeout_secs: u64,
     /// If true, after snapshot restore each child's guest clock is
     /// synchronized to host wall time by exec'ing `date -s @<ts>`
     /// via the guest agent (port 8888). This is the general fix for
@@ -618,6 +761,10 @@ pub struct ForkOpts {
     pub sync_guest_clocks: bool,
 }
 
+/// The historical hardcoded socket-wait budget, in seconds. Used as the
+/// default when `ForkOpts::socket_wait_timeout_secs` is 0.
+pub const DEFAULT_SOCKET_WAIT_SECS: u64 = 10;
+
 impl Default for ForkOpts {
     fn default() -> Self {
         Self {
@@ -628,6 +775,7 @@ impl Default for ForkOpts {
             prewarm_scratch_dir: None,
             memory_backend: MemoryBackend::File,
             enable_diff_snapshots: false,
+            socket_wait_timeout_secs: DEFAULT_SOCKET_WAIT_SECS,
             sync_guest_clocks: false,
         }
     }
@@ -636,7 +784,19 @@ impl Default for ForkOpts {
 /// Result of `Snapshot::restore_many` — N live children plus timing.
 #[derive(Debug)]
 pub struct ForkResult {
-    pub children: Vec<Vm>,
+    /// Successfully restored children, each with its 1-based within-batch
+    /// `child_index` so callers can map a surviving VM back to its
+    /// resource slot (netns/cgroup at `netns_offset + child_index`).
+    /// Failed children are NOT here — see `failures`.
+    pub children: Vec<ForkChild>,
+    /// Per-child failures collected during spawn, socket-wait, and
+    /// restore. Empty when every child succeeded. When non-empty,
+    /// `children` holds the successful subset (possibly empty) and the
+    /// caller decides whether to retry the failed indices or degrade.
+    /// `child_index` is the 1-based within-batch index, so a caller with
+    /// per-child resources (netns/cgroup at `netns_offset + child_index`)
+    /// can release exactly the failed slots.
+    pub failures: Vec<RestoreFailure>,
     pub spawn_ms: u128,
     pub restore_ms: u128,
     /// Wall-clock spent in the optional post-restore prewarm pass.
@@ -671,6 +831,80 @@ pub enum ClockSyncOutcome {
     /// clock. `error` describes what went wrong.
     Failed { child_index: usize, error: String },
 }
+
+/// A successfully restored child, paired with its 1-based within-batch
+/// index so callers can map it back to per-child resources (netns/cgroup
+/// at `netns_offset + child_index`). This preserves the child-to-VM
+/// mapping that a plain `Vec<Vm>` would lose when failures are filtered
+/// out (review feedback on #301: successes must retain their index).
+#[derive(Debug)]
+pub struct ForkChild {
+    /// 1-based within-batch child index (matches `child-{index}.sock`).
+    pub child_index: usize,
+    /// The restored VM handle (owns the firecracker Child process).
+    pub vm: Vm,
+}
+
+/// Which phase of `restore_many_with` a child failed in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestorePhase {
+    /// `spawn_firecracker_in` returned an error before the process existed.
+    Spawn,
+    /// The firecracker API socket never appeared within the wait budget.
+    SocketWait,
+    /// `PUT /snapshot/load` returned a non-2xx response (or a transport error).
+    Restore,
+}
+
+/// A single child's failure inside `restore_many_with`. Collected per
+/// child so a single bad spawn doesn't mask other failures (or silently
+/// drop already-spawned siblings). `pid` is `None` for `Spawn`-phase
+/// failures where the process was never created.
+#[derive(Debug, Clone)]
+pub struct RestoreFailure {
+    /// 1-based within-batch child index (matches `child-{index}.sock`).
+    pub child_index: usize,
+    /// The phase that failed.
+    pub phase: RestorePhase,
+    /// Firecracker PID when known (None for Spawn-phase failures).
+    pub pid: Option<u32>,
+    /// Human-readable error from the failing phase.
+    pub error: String,
+}
+
+/// Error returned by `restore_many_with` when one or more children fail.
+/// Carries every per-child failure so callers can report which specific
+/// child failed rather than a single bail that loses the batch context.
+/// Children that spawned successfully but could not be restored are
+/// killed (firecracker SIGKILL'd) before this is returned, so no live
+/// orphans remain from a partial failure.
+#[derive(Debug, Clone)]
+pub struct RestoreError {
+    pub failures: Vec<RestoreFailure>,
+}
+
+impl std::fmt::Display for RestoreError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "restore_many_with failed: {} child(ren) failed",
+            self.failures.len()
+        )?;
+        for fail in &self.failures {
+            write!(
+                f,
+                "; child {} {:?}: {}",
+                fail.child_index, fail.phase, fail.error
+            )?;
+            if let Some(pid) = fail.pid {
+                write!(f, " (pid {})", pid)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for RestoreError {}
 
 /// Response from the guest agent's `exec` action.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -949,7 +1183,7 @@ const CLOCK_SYNC_EXEC_TIMEOUT: Duration = Duration::from_secs(5);
 /// - **Adds latency to restore**: ~1-5 seconds per batch (agent polling
 ///   + exec), running in parallel across children. Measured at
 ///     ~1-2 seconds for typical Debian/Ubuntu-based images.
-fn sync_guest_clocks(children: &[Vm]) -> (u128, Vec<ClockSyncOutcome>) {
+fn sync_guest_clocks(children: &[&Vm]) -> (u128, Vec<ClockSyncOutcome>) {
     let start = Instant::now();
 
     let mut handles = Vec::with_capacity(children.len());
@@ -1276,6 +1510,16 @@ fn wait_for_sock(sock: &Path, timeout: Duration) -> Result<()> {
     let mut sleep_for = Duration::from_millis(1);
     let max_sleep = Duration::from_millis(20);
     while start.elapsed() < timeout {
+        // Check for a Unix-domain socket, not just path existence —
+        // a directory or regular file at the socket path must NOT
+        // satisfy the wait (review feedback on #301: a pre-created
+        // directory was incorrectly passing the check).
+        if sock.is_dir() {
+            bail!(
+                "socket path {} is a directory, not a socket",
+                sock.display()
+            );
+        }
         if sock.exists() {
             return Ok(());
         }
@@ -1808,6 +2052,7 @@ impl Snapshot {
                 prewarm_scratch_dir: None,
                 memory_backend: MemoryBackend::File,
                 enable_diff_snapshots: false,
+                socket_wait_timeout_secs: DEFAULT_SOCKET_WAIT_SECS,
                 sync_guest_clocks: false,
             },
             work_dir,
@@ -1854,7 +2099,8 @@ impl Snapshot {
 
         // Phase 1: spawn N firecracker processes, wait for sockets.
         let spawn_start = Instant::now();
-        let mut children: Vec<Vm> = Vec::with_capacity(n);
+        let mut children: Vec<Option<Vm>> = Vec::with_capacity(n);
+        let mut failures: Vec<RestoreFailure> = Vec::new();
         for i in 1..=n {
             // Per-child files use the within-batch index (1..=n) so work_dir
             // layout is predictable. Netns / cgroup index applies the offset
@@ -1869,20 +2115,98 @@ impl Snapshot {
             } else {
                 None
             };
-            let proc = spawn_firecracker_in(netns.as_deref(), &sock, &console)?;
-            let pid = proc.id();
-            children.push(Vm {
-                proc,
-                pid,
-                sock,
-                console,
-                netns,
-                cgroup: None,
-                memfd: None,
-            });
+            match spawn_firecracker_in(netns.as_deref(), &sock, &console) {
+                Ok(proc) => {
+                    let pid = proc.id();
+                    children.push(Some(Vm {
+                        proc,
+                        pid,
+                        sock,
+                        console,
+                        netns,
+                        cgroup: None,
+                        memfd: None,
+                    }));
+                }
+                Err(e) => {
+                    // Record the failure but keep spawning the rest so a
+                    // single bad spawn doesn't mask other failures. The
+                    // successful siblings are returned (partial success).
+                    failures.push(RestoreFailure {
+                        child_index: i,
+                        phase: RestorePhase::Spawn,
+                        pid: None,
+                        error: format!("{e:#}"),
+                    });
+                    children.push(None);
+                }
+            }
         }
-        for c in &children {
-            wait_for_sock(&c.sock, Duration::from_secs(10))?;
+        let socket_wait = Duration::from_secs(if opts.socket_wait_timeout_secs == 0 {
+            DEFAULT_SOCKET_WAIT_SECS
+        } else {
+            opts.socket_wait_timeout_secs
+        });
+        // Concurrent socket wait: one thread per spawned child, all with
+        // the SAME timeout so the batch is bounded by one timeout, not
+        // n × timeout. A failed child is dropped (killing its firecracker
+        // process) without disturbing siblings — partial success.
+        let sock_handles: Vec<(usize, thread::JoinHandle<Result<()>>)> = children
+            .iter()
+            .enumerate()
+            .filter_map(|(i, slot)| {
+                let vm = slot.as_ref()?;
+                let sock = vm.sock.clone();
+                let pid = vm.pid;
+                Some((
+                    i,
+                    thread::spawn(move || -> Result<()> {
+                        let wait_start = Instant::now();
+                        wait_for_sock(&sock, socket_wait)?;
+                        let elapsed = wait_start.elapsed();
+                        // Warn when a child takes >80% of the timeout to
+                        // appear — an early sign of contention (orphaned
+                        // VMs, tap/netns teardown races, fd pressure) that
+                        // may soon push the next spawn over.
+                        if elapsed > socket_wait * 4 / 5 {
+                            tracing::warn!(
+                                pid,
+                                sock = %sock.display(),
+                                elapsed_ms = elapsed.as_millis() as u64,
+                                timeout_ms = socket_wait.as_millis() as u64,
+                                "firecracker socket appeared near the wait budget; \
+                                 load contention may cause future spawns to time out"
+                            );
+                        }
+                        Ok(())
+                    }),
+                ))
+            })
+            .collect();
+        for (i, h) in sock_handles {
+            let pid = children[i].as_ref().map(|vm| vm.pid);
+            match h.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    failures.push(RestoreFailure {
+                        child_index: i + 1,
+                        phase: RestorePhase::SocketWait,
+                        pid,
+                        error: format!("{e:#}"),
+                    });
+                    // Dropping the child kills its firecracker process.
+                    children[i] = None;
+                }
+                Err(panic) => {
+                    failures.push(RestoreFailure {
+                        child_index: i + 1,
+                        phase: RestorePhase::SocketWait,
+                        pid,
+                        error: format!("socket-wait thread panicked: {panic:?}"),
+                    });
+                    children[i] = None;
+                }
+            }
         }
         let spawn_ms = spawn_start.elapsed().as_millis();
 
@@ -1891,7 +2215,10 @@ impl Snapshot {
         // restore so the limit applies to the memory image mmap as well.
         if let Some(mib) = opts.memory_limit_mib {
             let bytes = cgroup::mib_to_bytes(mib);
-            for (i, child) in children.iter_mut().enumerate() {
+            for (i, slot) in children.iter_mut().enumerate() {
+                let Some(child) = slot.as_mut() else {
+                    continue;
+                };
                 // Cgroup leaf name tracks the global netns index so per-child
                 // resource limits don't collide with siblings created by other
                 // batches on the same host.
@@ -1923,7 +2250,10 @@ impl Snapshot {
                     use_hugepages: true
                 }
             );
-            for (i, child) in children.iter_mut().enumerate() {
+            for (i, slot) in children.iter_mut().enumerate() {
+                let Some(child) = slot.as_mut() else {
+                    continue;
+                };
                 let region = memfd::create_and_populate(
                     &self.memory,
                     &format!("forkd-source-mem-{}", opts.netns_offset + i + 1),
@@ -1945,9 +2275,14 @@ impl Snapshot {
         // child only under MemfdShared (each child has its own memfd
         // path); for the File path, all children share the same JSON.
         let restore_start = Instant::now();
-        let bodies: Vec<String> = children
-            .iter()
-            .map(|c| match &c.memfd {
+        let mut handles: Vec<(usize, u32, thread::JoinHandle<Result<()>>)> = Vec::new();
+        for (i, slot) in children.iter().enumerate() {
+            let Some(c) = slot else {
+                continue;
+            };
+            let sock = c.sock.clone();
+            let pid = c.pid;
+            let body = match &c.memfd {
                 Some(region) => serde_json::json!({
                     "snapshot_path": &self.vmstate,
                     "mem_backend": {
@@ -1969,18 +2304,41 @@ impl Snapshot {
                     "resume_vm": true,
                 })
                 .to_string(),
-            })
-            .collect();
-
-        let mut handles = Vec::with_capacity(n);
-        for (c, body) in children.iter().zip(bodies) {
-            let sock = c.sock.clone();
-            handles.push(thread::spawn(move || -> Result<()> {
-                api_call(&sock, "PUT", "/snapshot/load", &body)
-            }));
+            };
+            handles.push((
+                i,
+                pid,
+                thread::spawn(move || -> Result<()> {
+                    api_call(&sock, "PUT", "/snapshot/load", &body)
+                }),
+            ));
         }
-        for h in handles {
-            h.join().expect("restore thread panicked")?;
+        for (i, pid, h) in handles {
+            match h.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    failures.push(RestoreFailure {
+                        child_index: i + 1,
+                        phase: RestorePhase::Restore,
+                        pid: Some(pid),
+                        error: format!("{e:#}"),
+                    });
+                    // Dropping the child kills its firecracker process.
+                    children[i] = None;
+                }
+                // A panicked thread is an unrecoverable child failure —
+                // collect it as a restore failure rather than panicking
+                // the caller, preserving the partial-failure contract.
+                Err(panic) => {
+                    failures.push(RestoreFailure {
+                        child_index: i + 1,
+                        phase: RestorePhase::Restore,
+                        pid: Some(pid),
+                        error: format!("restore thread panicked: {panic:?}"),
+                    });
+                    children[i] = None;
+                }
+            }
         }
         let restore_ms = restore_start.elapsed().as_millis();
 
@@ -2003,7 +2361,18 @@ impl Snapshot {
         // architecture, any Linux kernel, and any existing snapshot.
         // See issue #288 for the full options analysis.
         let (clock_sync_ms, clock_sync_outcomes) = if opts.sync_guest_clocks {
-            sync_guest_clocks(&children)
+            // `children` is `Vec<Option<Vm>>` (slots that failed spawn/
+            // socket-wait are `None`). Clock sync only applies to the
+            // successfully-restored children; the `child_index` used in
+            // outcomes is the 1-based within-batch slot index so callers
+            // can map outcomes back to resource slots.
+            //
+            // `sync_guest_clocks` only reads `child.netns` (cloned into the
+            // sync thread) so it does not need to own the `Vm`. Pass the
+            // live children by reference; `Vm` is not `Clone` (it owns a
+            // Child process).
+            let live: Vec<&Vm> = children.iter().flatten().collect();
+            sync_guest_clocks(&live)
         } else {
             (0, Vec::new())
         };
@@ -2018,7 +2387,7 @@ impl Snapshot {
             std::fs::create_dir_all(&scratch).context("create prewarm scratch dir")?;
             let prewarm_start = Instant::now();
             let mut handles = Vec::with_capacity(n);
-            for c in &children {
+            for c in children.iter().flatten() {
                 let sock = c.sock.clone();
                 let pid = c.pid;
                 let scratch = scratch.clone();
@@ -2068,7 +2437,17 @@ impl Snapshot {
         };
 
         Ok(ForkResult {
-            children,
+            children: children
+                .into_iter()
+                .enumerate()
+                .filter_map(|(i, slot)| {
+                    slot.map(|vm| ForkChild {
+                        child_index: i + 1,
+                        vm,
+                    })
+                })
+                .collect(),
+            failures,
             spawn_ms,
             restore_ms,
             prewarm_ms,
@@ -3116,6 +3495,7 @@ mod tests {
             prewarm_scratch_dir: None,
             memory_backend: MemoryBackend::File,
             enable_diff_snapshots: false,
+            socket_wait_timeout_secs: DEFAULT_SOCKET_WAIT_SECS,
             sync_guest_clocks: false,
         };
 
@@ -3130,7 +3510,7 @@ mod tests {
             fork_result.children.len()
         );
 
-        let restored_vm = fork_result.children.into_iter().next().unwrap();
+        let restored_vm = fork_result.children.into_iter().next().unwrap().vm;
 
         // Wait for guest agent on the restored VM
         let mut connected = false;
@@ -3248,6 +3628,7 @@ mod tests {
     fn fork_result_has_clock_sync_ms_field() {
         let fr = ForkResult {
             children: vec![],
+            failures: vec![],
             spawn_ms: 0,
             restore_ms: 0,
             prewarm_ms: 0,
@@ -3394,7 +3775,7 @@ mod tests {
         // Step 3: Run sync_guest_clocks — this is what #300 adds after
         // restore. The function captures host wall time and execs
         // `sh -c "date -s @<host_ts>"` in each child VM.
-        let (elapsed_ms, outcomes) = sync_guest_clocks(std::slice::from_ref(&vm));
+        let (elapsed_ms, outcomes) = sync_guest_clocks(std::slice::from_ref(&&vm));
         assert!(
             elapsed_ms < 30_000,
             "sync_guest_clocks took {elapsed_ms}ms, expected < 30s"
@@ -3727,5 +4108,272 @@ mod tests {
             now_called.load(Ordering::SeqCst),
             "now() must be called before set_clock, even when set_clock fails"
         );
+    }
+
+    // --- #301: per-VM partial-failure reporting -----------------------------
+    //
+    // The RestoreError/RestoreFailure types are pure data — they can be
+    // constructed and formatted without a firecracker process. These tests
+    // verify the Display contract and the phase enum so the structured
+    // error carries enough context for callers to report which child failed.
+
+    #[test]
+    fn restore_error_display_lists_all_failures() {
+        let err = RestoreError {
+            failures: vec![
+                RestoreFailure {
+                    child_index: 2,
+                    phase: RestorePhase::SocketWait,
+                    pid: Some(4455),
+                    error: "socket never appeared within 10s".to_string(),
+                },
+                RestoreFailure {
+                    child_index: 4,
+                    phase: RestorePhase::Restore,
+                    pid: Some(4457),
+                    error: "api_call: PUT /snapshot/load returned 400".to_string(),
+                },
+            ],
+        };
+        let s = format!("{err}");
+        assert!(
+            s.contains("2 child(ren) failed"),
+            "display should report count: {s}"
+        );
+        assert!(s.contains("child 2"), "display should name child 2: {s}");
+        assert!(
+            s.contains("SocketWait"),
+            "display should name SocketWait phase: {s}"
+        );
+        assert!(s.contains("pid 4455"), "display should include pid: {s}");
+        assert!(s.contains("child 4"), "display should name child 4: {s}");
+        assert!(
+            s.contains("Restore"),
+            "display should name Restore phase: {s}"
+        );
+        assert!(s.contains("400"), "display should include error: {s}");
+    }
+
+    #[test]
+    fn restore_error_single_failure_display() {
+        let err = RestoreError {
+            failures: vec![RestoreFailure {
+                child_index: 1,
+                phase: RestorePhase::Spawn,
+                pid: None,
+                error: "failed to spawn firecracker".to_string(),
+            }],
+        };
+        let s = format!("{err}");
+        assert!(s.contains("1 child(ren) failed"), "{s}");
+        assert!(s.contains("child 1"), "{s}");
+        assert!(s.contains("Spawn"), "{s}");
+        // Spawn-phase failures have no pid.
+        assert!(!s.contains("pid"), "Spawn failure should not show pid: {s}");
+    }
+
+    #[test]
+    fn restore_phase_eq_distinguishes_phases() {
+        assert_ne!(RestorePhase::Spawn, RestorePhase::SocketWait);
+        assert_ne!(RestorePhase::SocketWait, RestorePhase::Restore);
+        assert_ne!(RestorePhase::Spawn, RestorePhase::Restore);
+        assert_eq!(RestorePhase::Spawn, RestorePhase::Spawn);
+    }
+
+    // --- #301: pre-restore orphan detection ---------------------------------
+    //
+    // `scan_firecracker_orphans` is a read-only `/proc` scan on Linux and
+    // a no-op stub on non-Linux. The non-Linux stub contract is the only
+    // part testable without `/proc`: it must return an empty vec for any
+    // input (including a known-pid set that would otherwise exclude
+    // everything) so dev-box callers (macOS) don't panic.
+    //
+    // Non-Linux-gated: on Linux the real /proc scan runs and its result
+    // depends on which firecracker processes happen to be alive on the
+    // host, which is non-deterministic in CI and on dev boxes.
+    #[test]
+    #[cfg(not(target_os = "linux"))]
+    fn scan_firecracker_orphans_non_linux_returns_empty() {
+        let known: std::collections::HashSet<u32> = [1u32, 2, 3].into_iter().collect();
+        let orphans = scan_firecracker_orphans(&known);
+        assert!(
+            orphans.is_empty(),
+            "non-Linux stub should return no orphans, got {orphans:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(not(target_os = "linux"))]
+    fn scan_firecracker_orphans_empty_known_set_non_linux() {
+        let known: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        let orphans = scan_firecracker_orphans(&known);
+        assert!(orphans.is_empty());
+    }
+
+    // OrphanProcess and OrphanProcess fields are pure data — verify the
+    // struct can be constructed with expected fields so downstream logging
+    // and serialization (if added later) have a stable shape.
+    #[test]
+    fn orphan_process_struct_shape() {
+        let o = OrphanProcess {
+            pid: 12345,
+            elapsed_secs: 3600,
+            cmdline: "firecracker --api-sock /tmp/x.sock".to_string(),
+        };
+        assert_eq!(o.pid, 12345);
+        assert_eq!(o.elapsed_secs, 3600);
+        assert!(o.cmdline.contains("api-sock"));
+    }
+
+    /// Integration test: restore_many_with preserves successful siblings
+    /// when one child fails to spawn. Boots a real VM, snapshots it, then
+    /// restores two children with per-child netns. Child 1's netns is
+    /// pre-provisioned so it spawns and restores normally; child 2's netns
+    /// is deliberately left un-provisioned so `ip netns exec` fails at
+    /// spawn time. Child 2 is dropped (Spawn-phase failure) while child 1
+    /// survives.
+    ///
+    /// This exercises the partial-success contract: the result carries
+    /// one live child (with its child_index preserved) and one Spawn
+    /// failure, not an all-or-nothing error. Uses per_child_netns=true
+    /// (valid multi-child topology) per review feedback on #301.
+    #[test]
+    #[ignore = "requires Linux + KVM + firecracker + rootfs image"]
+    #[cfg(target_os = "linux")]
+    fn restore_many_partial_spawn_failure_keeps_siblings() {
+        let kernel = std::env::var("FORKD_TEST_KERNEL")
+            .unwrap_or_else(|_| "/var/lib/forkd/kernels/vmlinux".to_string());
+        let rootfs = std::env::var("FORKD_TEST_ROOTFS")
+            .expect("FORKD_TEST_ROOTFS must point to an ext4 rootfs image");
+
+        assert!(
+            std::path::Path::new(&kernel).exists(),
+            "FORKD_TEST_KERNEL not found at {kernel}"
+        );
+        assert!(
+            std::path::Path::new(&rootfs).exists(),
+            "FORKD_TEST_ROOTFS not found at {rootfs}"
+        );
+
+        let work_dir =
+            std::env::temp_dir().join(format!("forkd-restore-partial-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&work_dir);
+        let addr = "10.42.0.2:8888".to_string();
+
+        // Pre-flight: no stale VM should already occupy the agent address.
+        assert!(
+            ping_at(&addr).is_err(),
+            "{addr} is already reachable — a stale VM may occupy the address"
+        );
+
+        // Boot a parent VM and snapshot it.
+        let cfg = BootConfig::ext4_rw(kernel.into(), rootfs.into(), work_dir.clone())
+            .with_network(NetworkConfig::default_tap("forkd-tap0"));
+        let vm = Vm::boot(&cfg).expect("boot parent VM");
+        let mut connected = false;
+        for _ in 0..60 {
+            std::thread::sleep(Duration::from_millis(500));
+            if ping_at(&addr).is_ok() {
+                connected = true;
+                break;
+            }
+        }
+        assert!(connected, "parent VM agent did not respond within 30s");
+
+        let snap_dir = work_dir.join("snap");
+        std::fs::create_dir_all(&snap_dir).expect("create snap dir");
+        vm.pause().expect("pause parent");
+        let snapshot = vm
+            .snapshot_to(
+                snap_dir.join("vmstate"),
+                snap_dir.join("memory.bin"),
+                Vec::new(),
+            )
+            .expect("snapshot parent");
+        drop(vm); // kills parent, frees the shared guest agent address
+
+        // Restore two children with per-child netns (valid multi-child
+        // topology). Child 1's netns is pre-provisioned; child 2's is
+        // deliberately left un-provisioned so `ip netns exec` fails and the
+        // spawn is recorded as a Spawn-phase failure.
+        let netns_offset = std::process::id() as usize * 10;
+        let child1_netns = format!("forkd-child-{}", netns_offset + 1);
+        // Child 2 netns (forkd-child-{netns_offset+2}) is deliberately NOT
+        // provisioned — that is the failure injection (spawn fails).
+
+        // Pre-provision child 1's netns only.
+        let netns_created = std::process::Command::new("ip")
+            .args(["netns", "add", &child1_netns])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !netns_created {
+            // Cannot create netns (not root or ip not available) — skip.
+            // Clean up the parent snapshot files we created.
+            let _ = std::fs::remove_dir_all(&work_dir);
+            eprintln!("skipped: could not create netns {child1_netns} (need root)");
+            return;
+        }
+
+        let restore_dir = work_dir.join("restore");
+        std::fs::create_dir_all(&restore_dir).expect("create restore dir");
+
+        let result = snapshot
+            .restore_many_with(
+                ForkOpts {
+                    n: 2,
+                    per_child_netns: true,
+                    netns_offset,
+                    socket_wait_timeout_secs: 10,
+                    ..ForkOpts::default()
+                },
+                &restore_dir,
+            )
+            .expect("restore_many_with returned a fatal error");
+
+        // Partial success: child 1 alive (with child_index=1), child 2
+        // failed at Spawn (netns does not exist).
+        assert_eq!(
+            result.children.len(),
+            1,
+            "expected 1 surviving child, got {}",
+            result.children.len()
+        );
+        assert_eq!(
+            result.children[0].child_index, 1,
+            "surviving child should retain child_index=1"
+        );
+        assert_eq!(
+            result.failures.len(),
+            1,
+            "expected 1 failure, got {:?}",
+            result.failures
+        );
+        let fail = &result.failures[0];
+        assert_eq!(
+            fail.child_index, 2,
+            "expected child 2 to fail, got {:?}",
+            fail
+        );
+        assert!(
+            matches!(fail.phase, RestorePhase::Spawn),
+            "expected Spawn-phase failure (netns not provisioned), got {:?}",
+            fail.phase
+        );
+
+        // The surviving child is actually a live firecracker process.
+        let child = &result.children[0].vm;
+        assert!(
+            child.is_alive(),
+            "surviving child (pid {}) should be alive",
+            child.pid()
+        );
+
+        drop(result);
+        let _ = std::fs::remove_dir_all(&work_dir);
+        // Clean up the pre-provisioned netns.
+        let _ = std::process::Command::new("ip")
+            .args(["netns", "del", &child1_netns])
+            .status();
     }
 }

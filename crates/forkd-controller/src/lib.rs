@@ -143,7 +143,11 @@ pub async fn run_daemon(cfg: DaemonConfig) -> Result<()> {
         // bound is derived from the provisioned pool on disk instead of
         // a magic constant.
         netns_alloc: crate::netns::NetnsAllocator::discover("/var/run/netns"),
+        // #281: shared-tap ownership cell (claim/commit/RAII lifecycle).
         shared_tap_owner: std::sync::Arc::new(parking_lot::Mutex::new(None)),
+        // #302: diagnostic counter for orphaned firecracker processes
+        // detected during the pre-restore scan. Exposed as a metric.
+        orphan_firecrackers_detected: std::sync::atomic::AtomicU64::new(0),
         prewarm_scratch_dir: cfg.prewarm_scratch_dir.clone(),
         #[cfg(target_os = "linux")]
         live_in_flight: Mutex::new(HashMap::new()),
