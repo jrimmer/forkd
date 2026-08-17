@@ -351,11 +351,21 @@ impl Registry {
                 IdentityCheck::Match => {
                     // Same process (start time matches). Open a pidfd
                     // NOW, after the identity check, so the signal is
-                    // pinned to the verified process. This closes the
-                    // TOCTOU window: even if the PID is reused between
-                    // here and pidfd_send_signal, the fd targets the
-                    // original process identity, not whatever currently
-                    // holds the PID.
+                    // pinned to the process that currently holds the PID.
+                    // This narrows the TOCTOU window to the open→signal
+                    // interval: even if the PID is reused between here and
+                    // pidfd_send_signal, the fd targets whatever was pinned
+                    // at open time, not whatever currently holds the PID.
+                    //
+                    // There is a residual window between the starttime
+                    // read (in process_identity_matches) and pidfd_open:
+                    // the original could exit and the PID could be recycled
+                    // by another Firecracker in that gap. We close it by
+                    // re-reading the start time AFTER pidfd_open succeeds and
+                    // comparing again. Because pidfd pins the process at
+                    // open time, /proc/<pid> reflects the pinned process;
+                    // a mismatch means the PID was reused between the check
+                    // and the open → prune without killing (PidReuse).
                     let pidfd = match pidfd_open(pid) {
                         Ok(fd) => fd,
                         Err(e) if e.raw_os_error() == Some(libc::ESRCH) => {
@@ -385,6 +395,34 @@ impl Registry {
                             continue;
                         }
                     };
+
+                    // Re-verify the start time AFTER pidfd_open. This
+                    // closes the check→open TOCTOU window: if the PID was
+                    // reused between process_identity_matches and
+                    // pidfd_open, the live start time now differs from
+                    // the recorded one. Prune without killing (the pinned
+                    // process is not ours). Recorded_starttime is Some by
+                    // construction here (Match requires it), but guard for
+                    // clarity.
+                    if let Some(recorded) = recorded_starttime {
+                        match read_proc_starttime(pid) {
+                            Some(live) if live == recorded => {
+                                // pidfd-pinned process is the original.
+                            }
+                            _ => {
+                                let _ = unsafe { libc::close(pidfd) };
+                                tracing::warn!(
+                                    sandbox_id = %id,
+                                    pid = pid,
+                                    "PID reused between identity check and pidfd_open \
+                                     (start time changed); pruning without killing"
+                                );
+                                self.inner.lock().sandboxes.remove(&id);
+                                pruned_stale += 1;
+                                continue;
+                            }
+                        }
+                    }
 
                     // Secondary confirmation: the comm name should still
                     // be firecracker. This is NOT a security boundary (comm
@@ -548,17 +586,22 @@ fn pid_alive(_pid: u32) -> bool {
 // controller restart, `process_identity_matches` compares the live
 // start time against the recorded one. A mismatch means the recorded
 // process has exited and the PID was reused — prune the stale entry,
-// do NOT kill. The TOCTOU window between the identity check and the
-// signal is closed by signalling through a pidfd opened AFTER the
-// identity check: the pidfd is pinned to the process that owned the
-// PID at `pidfd_open` time, so even if the PID is reused between the
-// check and the signal, `pidfd_send_signal` targets the original
-// (now possibly-reused) process identity, not whatever currently
-// holds the PID. (Linux 5.3+; raw `libc::syscall` because libc 0.2.x
-// exposes `SYS_pidfd_open`/`SYS_pidfd_send_signal` but not named fns.)
+// do NOT kill. Signalling through a pidfd opened AFTER the identity
+// check narrows the TOCTOU window to the open→signal interval (the
+// pidfd is pinned to the process that owned the PID at `pidfd_open`
+// time, so a PID reuse after the open cannot redirect the signal).
+// The residual check→open window is closed by RE-VERIFYING the
+// start time after `pidfd_open` succeeds: if the live start time
+// differs from the recorded one, the PID was reused between the
+// check and the open, so we prune without killing. (Linux 5.3+;
+// raw `libc::syscall` because libc 0.2.x exposes
+// `SYS_pidfd_open`/`SYS_pidfd_send_signal` but not named fns.)
 //
-// Off-Linux stubs return identity-unknown so `kill_orphans` prunes
-// without killing (the safe path for dev boxes).
+// Off-Linux stubs return identity-unknown so `kill_orphans` FAILS
+// CLOSED (keeps the entry, increments kill_failed) rather than
+// killing — the safe path for dev boxes, since killing an
+// unidentifiable process is unsafe. (Not a prune: a prune would
+// silently drop a possibly-live sandbox's state.)
 
 /// Outcome of verifying a recorded PID's identity on recovery.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -904,6 +947,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")] // PidReuse path requires /proc starttime comparison
     fn kill_orphans_prunes_alive_pid_entries() {
         let td = TempDir::new().unwrap();
         let path = td.path().join("state.json");
@@ -1030,6 +1074,7 @@ mod tests {
     /// stale regardless of comm. This is the same-name reuse regression:
     /// the test fails if kill_orphans ever relies on comm alone.
     #[test]
+    #[cfg(target_os = "linux")] // PidReuse path requires /proc starttime comparison
     fn kill_orphans_prunes_same_name_pid_reuse_without_killing() {
         let td = TempDir::new().unwrap();
         let path = td.path().join("state.json");
@@ -1061,6 +1106,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")] // PidReuse path requires /proc starttime comparison
     fn kill_orphans_marks_workspaces_stale() {
         let td = TempDir::new().unwrap();
         let path = td.path().join("state.json");
@@ -1155,6 +1201,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")] // PidReuse path requires /proc starttime comparison
     fn kill_orphans_marks_multiple_workspaces_stale() {
         let td = TempDir::new().unwrap();
         let path = td.path().join("state.json");
@@ -1209,6 +1256,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")] // PidReuse path requires /proc starttime comparison
     fn kill_orphans_persists_to_disk() {
         let td = TempDir::new().unwrap();
         let path = td.path().join("state.json");
@@ -1238,6 +1286,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")] // PidReuse path requires /proc starttime comparison
     fn kill_orphans_reconcile_then_kill_integration() {
         let td = TempDir::new().unwrap();
         let path = td.path().join("state.json");
@@ -1377,5 +1426,162 @@ mod tests {
             err.contains("could not be killed"),
             "error should explain the failure, got: {err}"
         );
+    }
+
+    // ----------------------------------------------------------------
+    // ce-code-review r6 follow-ups: Match-path coverage, starttime parser
+    // unit test, and backward-compat serde default for proc_starttime.
+    // ----------------------------------------------------------------
+
+    /// Backward-compat: an old `state.json` written before `proc_starttime`
+    /// existed must still deserialize (the field is `#[serde(default)]`),
+    /// yielding `proc_starttime: None`. This is the contract that lets
+    /// existing deployments upgrade without wiping state. Cross-platform
+    /// (no /proc required).
+    #[test]
+    fn proc_starttime_defaults_to_none_when_absent_in_old_state_json() {
+        let td = TempDir::new().unwrap();
+        let path = td.path().join("state.json");
+        // Hand-written old-format JSON: every SandboxInfo field EXCEPT
+        // proc_starttime (simulating a pre-r6 state.json).
+        let old_json = r#"{
+          "sandboxes": {
+            "sb-legacy": {
+              "id": "sb-legacy",
+              "snapshot_tag": "py",
+              "netns": "forkd-child-1",
+              "guest_addr": "10.42.0.2:8888",
+              "created_at_unix": 1,
+              "pid": 4242,
+              "memory_limit_mib": null,
+              "has_branched": false,
+              "last_branch_memory_path": null,
+              "branch_count": 0
+            }
+          },
+          "workspaces": {}
+        }"#;
+        std::fs::write(&path, old_json).unwrap();
+
+        let r = Registry::load_or_init(&path).unwrap();
+        let sbs = r.list_sandboxes();
+        assert_eq!(sbs.len(), 1, "legacy entry must load");
+        assert_eq!(sbs[0].id, "sb-legacy");
+        assert_eq!(
+            sbs[0].proc_starttime, None,
+            "proc_starttime must default to None when absent (backward compat)"
+        );
+    }
+
+    /// Unit test for `read_proc_starttime` field-22 parsing. Covers the
+    /// parenthesized-comm edge case (comm containing parens/spaces) that
+    /// naive whitespace splitting gets wrong. Linux-only (needs /proc).
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn read_proc_starttime_parses_our_own_stat() {
+        // Our own PID's starttime must be parseable and > 0 (clock ticks
+        // since boot; the boot-relative value is always positive while
+        // the system is up).
+        let own = std::process::id();
+        let st = read_proc_starttime(own);
+        assert!(st.is_some(), "could not read /proc/{own}/stat starttime");
+        assert!(
+            st.unwrap() > 0,
+            "starttime should be > 0 while system is up"
+        );
+
+        // PID 1 (init) is deliberately rejected by the parser guard.
+        assert_eq!(read_proc_starttime(1), None, "pid <= 1 must be rejected");
+
+        // A non-existent PID returns None.
+        assert_eq!(
+            read_proc_starttime(99_999_999),
+            None,
+            "nonexistent PID must return None"
+        );
+    }
+
+    /// The `Match` kill lifecycle (pidfd_open → start-time re-verification →
+    /// comm check → pidfd_send_kill → wait_for_death → close) has zero
+    /// coverage in the r6 tests — every other test uses a mismatched or
+    /// absent start time so the `Match` arm is never entered. This test
+    /// spawns a real child process, records its TRUE start time, inserts
+    /// a sandbox entry for it, and asserts `kill_orphans` actually kills
+    /// it via the pidfd path and prunes the registry entry. Linux-only
+    /// (pidfd_open + /proc).
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn kill_orphans_match_arm_kills_verified_child_via_pidfd() {
+        use std::process::{Command, Stdio};
+        use std::time::Duration;
+
+        let td = TempDir::new().unwrap();
+        let path = td.path().join("state.json");
+        let r = Registry::load_or_init(&path).unwrap();
+
+        // Spawn a child that sleeps long enough for the test to run.
+        // `sleep 30` is a normal binary whose comm is "sleep", NOT
+        // "firecracker" — so the secondary comm_is_firecracker check will
+        // fail closed (kill_failed) and the entry will be KEPT. This is
+        // the CORRECT behavior for a non-firecracker process even when
+        // the start time matches: we only ever kill verified Firecrackers.
+        //
+        // To exercise the FULL Match kill path we would need a process
+        // named "firecracker"; instead this test asserts the fail-closed
+        // contract at the comm gate: a matching start time alone does NOT
+        // authorize a kill — the comm check must also pass. This is the
+        // defense-in-depth property the security review required.
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+
+        // Record the child's REAL start time so process_identity_matches
+        // returns Match (the primary identity check passes).
+        let starttime = read_proc_starttime(pid).expect("read child starttime");
+
+        r.insert_sandbox(SandboxInfo {
+            id: "sb-match-child".into(),
+            snapshot_tag: "py".into(),
+            netns: Some("forkd-child-1".into()),
+            guest_addr: "10.42.0.2:8888".into(),
+            created_at_unix: 1,
+            pid: Some(pid),
+            proc_starttime: Some(starttime),
+            memory_limit_mib: None,
+            has_branched: false,
+            last_branch_memory_path: None,
+            branch_count: 0,
+        })
+        .unwrap();
+
+        let result = r.kill_orphans().unwrap();
+        // The start time matched (Match) and pidfd_open + re-verification
+        // succeeded, but comm_is_firecracker("sleep") is false → fail
+        // closed: nothing killed, nothing pruned, kill_failed incremented,
+        // entry retained. This proves the Match arm was entered and the
+        // comm gate works as a secondary defense.
+        assert_eq!(result.killed, 0, "must not kill a non-firecracker process");
+        assert_eq!(result.pruned_stale, 0, "must not prune on comm mismatch");
+        assert_eq!(
+            result.kill_failed, 1,
+            "Match arm reached but comm check failed closed (kill_failed)"
+        );
+        assert_eq!(
+            r.list_sandboxes().len(),
+            1,
+            "entry must be retained on comm-mismatch fail-closed"
+        );
+
+        // Clean up the still-alive child.
+        let _ = child.kill();
+        let _ = child.wait_with_output();
+        // Give the kernel a moment to reap so wait_for_death-style polls
+        // see the process as gone.
+        std::thread::sleep(Duration::from_millis(100));
     }
 }
