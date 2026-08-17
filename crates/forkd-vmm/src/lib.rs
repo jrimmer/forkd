@@ -958,75 +958,68 @@ fn sync_guest_clocks(children: &[Vm]) -> (u128, Vec<ClockSyncOutcome>) {
         handles.push(thread::spawn(move || -> Result<()> {
             let addr = GUEST_AGENT_ADDR.to_string();
 
-            // Poll the guest agent until it responds or the timeout
-            // expires. The agent (forkd-agent.py) starts as PID 1 and
-            // begins listening on port 8888 as soon as init runs. For
-            // snapshot-restored VMs, the guest is already past kernel
-            // boot — only the agent's TCP listener needs to come up.
-            let deadline = Instant::now() + CLOCK_SYNC_AGENT_TIMEOUT;
-            loop {
-                let ping_result = match &netns {
-                    Some(ns) => ping_in_netns(ns, addr.clone()),
-                    None => ping_at(&addr),
-                };
-                if ping_result.is_ok() {
-                    break;
-                }
-                if Instant::now() >= deadline {
-                    bail!(
-                        "guest agent at {addr} did not respond within {}s",
-                        CLOCK_SYNC_AGENT_TIMEOUT.as_secs()
-                    );
-                }
-                thread::sleep(Duration::from_millis(200));
-            }
-
-            // Capture the host timestamp AFTER the agent is confirmed
-            // alive, immediately before exec. The old approach captured
-            // it before polling — a child that became ready near the
-            // 10-second deadline was set ~10 seconds in the past.
-            // Capturing per-child after ping minimizes the gap between
-            // timestamp capture and the date -s exec.
-            let now = SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            let date_cmd = format!("date -s @{now}");
-
-            // Agent is alive — set the guest clock to host wall time.
-            // We invoke `sh -c "date -s @<timestamp>"` because the guest
-            // agent's exec handler passes args directly to
-            // `subprocess.run(args)` — a bare `["-c", cmd]` would try
-            // to execute a program named "-c" and fail. The `sh -c`
-            // form runs the date command through the shell.
+            // Readiness probe: poll the guest agent until it responds
+            // or the timeout expires. The agent (forkd-agent.py) starts
+            // as PID 1 and begins listening on port 8888 as soon as init
+            // runs. For snapshot-restored VMs, the guest is already past
+            // kernel boot — only the agent's TCP listener needs to come
+            // up.
             //
-            // `date -s @<timestamp>` is supported by GNU coreutils date
-            // (≥ 8.5) and busybox date (with FEATURE_DATE_COMPAT). All
-            // forkd images are built from Debian/Ubuntu Docker bases,
-            // so GNU date is guaranteed.
-            let exec_result = match &netns {
-                Some(ns) => exec_in_netns(
-                    ns,
-                    addr.clone(),
-                    vec!["sh".into(), "-c".into(), date_cmd],
-                    CLOCK_SYNC_EXEC_TIMEOUT,
-                ),
-                None => exec_at(
-                    &addr,
-                    vec!["sh".into(), "-c".into(), date_cmd],
-                    CLOCK_SYNC_EXEC_TIMEOUT,
-                ),
+            // The probe is a closure so the timestamp-placement logic in
+            // `sync_one_child_clock` can be unit-tested with a
+            // deterministic delayed-readiness probe (see
+            // `sync_one_child_clock_timestamp_fresh_after_delayed_ping`).
+            let ping = || match &netns {
+                Some(ns) => ping_in_netns(ns, addr.clone()).map(|_| ()),
+                None => ping_at(&addr).map(|_| ()),
             };
 
-            match exec_result {
-                Ok(resp) if resp.exit_code == 0 => Ok(()),
-                Ok(resp) => bail!(
-                    "date -s exited with {}: {}",
-                    resp.exit_code,
-                    resp.stderr.trim()
-                ),
-                Err(e) => Err(e),
-            }
+            // Timestamp source: host wall time. Captured per child,
+            // AFTER ping succeeds — see `sync_one_child_clock`.
+            let now = || {
+                SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+            };
+
+            // Clock-setter: invoke `sh -c "date -s @<ts>"` via the guest
+            // agent's exec. We use `sh -c` because the guest agent's exec
+            // handler passes args directly to `subprocess.run(args)` — a
+            // bare `["-c", cmd]` would try to execute a program named
+            // "-c" and fail.
+            //
+            // `date -s @<ts>` is supported by GNU coreutils date (≥ 8.5)
+            // and busybox date (with FEATURE_DATE_COMPAT). All forkd
+            // images are built from Debian/Ubuntu Docker bases, so GNU
+            // date is guaranteed.
+            let set_clock = |ts: u64| {
+                let date_cmd = format!("date -s @{ts}");
+                let exec_result = match &netns {
+                    Some(ns) => exec_in_netns(
+                        ns,
+                        addr.clone(),
+                        vec!["sh".into(), "-c".into(), date_cmd],
+                        CLOCK_SYNC_EXEC_TIMEOUT,
+                    ),
+                    None => exec_at(
+                        &addr,
+                        vec!["sh".into(), "-c".into(), date_cmd],
+                        CLOCK_SYNC_EXEC_TIMEOUT,
+                    ),
+                };
+                match exec_result {
+                    Ok(resp) if resp.exit_code == 0 => Ok(()),
+                    Ok(resp) => bail!(
+                        "date -s exited with {}: {}",
+                        resp.exit_code,
+                        resp.stderr.trim()
+                    ),
+                    Err(e) => Err(e),
+                }
+            };
+
+            sync_one_child_clock(ping, now, set_clock)
         }));
     }
 
@@ -1081,6 +1074,65 @@ fn sync_guest_clocks(children: &[Vm]) -> (u128, Vec<ClockSyncOutcome>) {
     }
 
     (start.elapsed().as_millis(), outcomes)
+}
+
+/// Synchronize one child's guest clock to host wall time.
+///
+/// This is the core timestamp-placement logic, extracted from
+/// `sync_guest_clocks` so it can be unit-tested with injectable
+/// readiness probe / timestamp source / clock-setter closures — no
+/// VM, guest agent, or KVM required.
+///
+/// # The property under test
+///
+/// The host timestamp MUST be captured **after** the readiness probe
+/// (`ping`) succeeds, immediately before `set_clock`. The earlier
+/// implementation captured it **before** polling; a child whose agent
+/// became ready near the 10-second deadline was set ~10 seconds in the
+/// past, breaking TLS certificate validation and token expiry.
+///
+/// Capturing per-child after ping minimizes the gap between timestamp
+/// capture and the `date -s` exec, so the guest clock matches host wall
+/// time to within the (sub-second) ping→exec round-trip.
+///
+/// # Arguments
+///
+/// - `ping` — readiness probe. Called repeatedly until it returns `Ok`
+///   or `CLOCK_SYNC_AGENT_TIMEOUT` elapses. In production this polls
+///   the guest agent at `GUEST_AGENT_ADDR`; in tests it is a
+///   deterministic closure that fails for a fixed duration then
+///   succeeds, so the induced poll delay exceeds the accepted clock
+///   drift and the timestamp-freshness assertion is meaningful.
+/// - `now` — timestamp source (host wall time, seconds since UNIX
+///   epoch). Injected so tests can pin time.
+/// - `set_clock` — invokes `date -s @<ts>` via the guest agent. In
+///   tests this records the timestamp passed so the test can assert
+///   freshness.
+fn sync_one_child_clock(
+    mut ping: impl FnMut() -> Result<()>,
+    now: impl Fn() -> u64,
+    set_clock: impl FnOnce(u64) -> Result<()>,
+) -> Result<()> {
+    let deadline = Instant::now() + CLOCK_SYNC_AGENT_TIMEOUT;
+    loop {
+        if ping().is_ok() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "guest agent did not respond within {}s",
+                CLOCK_SYNC_AGENT_TIMEOUT.as_secs()
+            );
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+
+    // Capture the host timestamp AFTER the agent is confirmed alive,
+    // immediately before set_clock. The old approach captured it before
+    // polling — a child that became ready near the 10-second deadline
+    // was set ~10 seconds in the past.
+    let ts = now();
+    set_clock(ts)
 }
 
 // ---------------------------------------------------------------------------
@@ -3398,101 +3450,153 @@ mod tests {
         drop(vm);
     }
 
-    /// Integration test: sync_guest_clocks handles a delayed agent and
-    /// captures a FRESH timestamp. Unlike `sync_guest_clocks_corrects_wrong_clock`
-    /// (which waits for the agent first), this test calls sync_guest_clocks
-    /// immediately after boot — the agent is not yet listening, so the
-    /// function must poll for it. The timestamp is captured AFTER ping
-    /// succeeds, so the final guest clock must match the host wall time
-    /// closely (within a few seconds), NOT be stale by the poll duration.
+    /// Deterministic unit test: `sync_one_child_clock` captures a FRESH
+    /// timestamp AFTER the readiness probe succeeds, not before polling.
     ///
-    /// If the timestamp were captured before polling (the old behavior),
-    /// a multi-second agent startup would leave the guest clock that many
-    /// seconds in the past.
+    /// This is the regression for the delayed-agent-readiness finding: the
+    /// previous `sync_guest_clocks_delayed_agent_readiness` integration test
+    /// was non-deterministic — it called sync immediately and only checked
+    /// the final drift plus an upper elapsed bound, so it never *guaranteed*
+    /// that agent readiness was actually delayed beyond the accepted 3-second
+    /// drift. If the agent came up quickly, the old pre-poll-timestamp
+    /// implementation still passed.
+    ///
+    /// This test injects a readiness probe that **deterministically** fails
+    /// for 4 seconds (> the 3s accepted drift) then succeeds, and a `now`
+    /// source that records when it was called relative to the probe. It then
+    /// asserts:
+    ///   1. the induced poll delay (4s) exceeds the accepted clock drift (3s),
+    ///   2. the timestamp passed to `set_clock` was captured AFTER ping
+    ///      succeeded (i.e. fresh), so a pre-poll-timestamp implementation
+    ///      would fail this assertion by ~4s,
+    ///   3. `set_clock` is actually invoked with that fresh timestamp.
+    ///
+    /// No VM, guest agent, or KVM is required — this runs in the unit-test
+    /// suite on every platform. The end-to-end mechanism (real agent +
+    /// `date -s`) is still covered by the `#[ignore]` integration test
+    /// `sync_guest_clocks_corrects_wrong_clock`.
     #[test]
-    #[ignore = "requires Linux + KVM + firecracker + rootfs image"]
-    #[cfg(target_os = "linux")]
-    fn sync_guest_clocks_delayed_agent_readiness() {
-        let kernel = std::env::var("FORKD_TEST_KERNEL")
-            .unwrap_or_else(|_| "/var/lib/forkd/kernels/vmlinux".to_string());
-        let rootfs = std::env::var("FORKD_TEST_ROOTFS")
-            .expect("FORKD_TEST_ROOTFS must point to an ext4 rootfs image");
+    fn sync_one_child_clock_timestamp_fresh_after_delayed_ping() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::sync::Arc;
 
+        // The accepted clock drift the integration test used was 3 seconds.
+        // The induced poll delay MUST exceed it, otherwise the test cannot
+        // distinguish fresh-from-stale timestamp placement.
+        const ACCEPTED_DRIFT_SECS: u64 = 3;
+        const INDUCED_DELAY_SECS: u64 = ACCEPTED_DRIFT_SECS + 1; // 4s
+        let induced_delay = Duration::from_secs(INDUCED_DELAY_SECS);
+
+        // Shared mutable state for the injected probes.
+        let probe_start = Instant::now();
+        let probe_ready_at = Arc::new(AtomicU64::new(0)); // wall-time secs when ping first Ok'd
+        let now_called_at = Arc::new(AtomicU64::new(0)); // wall-time secs when `now` was called
+        let set_clock_called = Arc::new(AtomicBool::new(false));
+        let set_clock_ts = Arc::new(AtomicU64::new(0)); // timestamp passed to set_clock
+
+        // Readiness probe: fails for `induced_delay`, then succeeds.
+        // Records the wall time of the first success.
+        let probe_ready_at_cl = probe_ready_at.clone();
+        let ping = move || -> Result<()> {
+            if probe_start.elapsed() >= induced_delay {
+                probe_ready_at_cl.store(
+                    SystemTime::now()
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs(),
+                    Ordering::SeqCst,
+                );
+                Ok(())
+            } else {
+                bail!("agent not ready")
+            }
+        };
+
+        // Timestamp source: returns wall time and records when it was called.
+        let now_called_at_cl = now_called_at.clone();
+        let now = || {
+            let secs = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            now_called_at_cl.store(secs, Ordering::SeqCst);
+            secs
+        };
+
+        // Clock-setter: records the timestamp it was invoked with.
+        let set_clock_called_cl = set_clock_called.clone();
+        let set_clock_ts_cl = set_clock_ts.clone();
+        let set_clock = move |ts: u64| {
+            set_clock_called_cl.store(true, Ordering::SeqCst);
+            set_clock_ts_cl.store(ts, Ordering::SeqCst);
+            Ok(())
+        };
+
+        let poll_start = Instant::now();
+        sync_one_child_clock(ping, now, set_clock)
+            .expect("sync_one_child_clock should succeed once the probe is ready");
+        let poll_elapsed = poll_start.elapsed();
+
+        // (1) The induced poll delay must exceed the accepted drift — this is
+        // what makes the test deterministic. If the probe became ready before
+        // the accepted drift, the test could not distinguish fresh from stale.
         assert!(
-            std::path::Path::new(&kernel).exists(),
-            "FORKD_TEST_KERNEL not found at {kernel}"
+            poll_elapsed >= induced_delay,
+            "poll elapsed {:?} is less than the induced delay {:?} — \
+             the probe became ready too early, so the freshness assertion \
+             below would not catch a pre-poll timestamp",
+            poll_elapsed,
+            induced_delay
+        );
+        // Compile-time invariant: the induced delay MUST exceed the accepted
+        // drift, otherwise the freshness assertion below could not distinguish
+        // a fresh (post-ping) timestamp from a stale (pre-poll) one.
+        const _: () = {
+            assert!(INDUCED_DELAY_SECS > ACCEPTED_DRIFT_SECS);
+        };
+
+        // (2) The timestamp was captured AFTER ping succeeded. The old
+        // pre-poll implementation captured `now()` before the loop, so
+        // `now_called_at` would be ~`INDUCED_DELAY_SECS` earlier than
+        // `probe_ready_at`. A fresh (post-ping) implementation captures
+        // `now()` after, so `now_called_at >= probe_ready_at`.
+        let ready_at = probe_ready_at.load(Ordering::SeqCst);
+        let now_at = now_called_at.load(Ordering::SeqCst);
+        assert!(
+            ready_at > 0,
+            "readiness probe never succeeded — ping did not record a \
+             ready timestamp"
         );
         assert!(
-            std::path::Path::new(&rootfs).exists(),
-            "FORKD_TEST_ROOTFS not found at {rootfs}"
+            now_at >= ready_at,
+            "timestamp was captured at {now_at}, BEFORE ping succeeded at \
+             {ready_at} (stale by ~{}s) — `now()` must be called AFTER the \
+             readiness probe succeeds, not before polling",
+            ready_at.saturating_sub(now_at)
         );
 
-        let work_dir =
-            std::env::temp_dir().join(format!("forkd-clocksync-delayed-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&work_dir);
-        let _work_dir_guard = WorkDirGuard(work_dir.clone());
-
-        let addr = GUEST_AGENT_ADDR.to_string();
+        // The freshness gap (now - ready) must be well under the accepted
+        // drift. With a fresh post-ping timestamp this is sub-second; with
+        // the old pre-poll timestamp it would be ~INDUCED_DELAY_SECS.
+        let freshness_gap = now_at.saturating_sub(ready_at);
         assert!(
-            ping_at(&addr).is_err(),
-            "{addr} is already reachable — a stale VM may occupy the address; \
-             kill it before running this test"
+            freshness_gap <= ACCEPTED_DRIFT_SECS,
+            "timestamp freshness gap is {freshness_gap}s (>= accepted drift \
+             {ACCEPTED_DRIFT_SECS}s) — the timestamp was captured too long \
+             before set_clock, reproducing the stale-clock bug"
         );
 
-        let cfg = BootConfig::ext4_rw(kernel.into(), rootfs.into(), work_dir.clone())
-            .with_network(NetworkConfig::default_tap("forkd-tap0"));
-
-        let vm = Vm::boot(&cfg).expect("boot VM");
-
-        // Deliberately do NOT pre-wait for the agent. Call sync_guest_clocks
-        // immediately so it must poll for a not-yet-ready agent. This is the
-        // "delayed agent readiness" scenario.
-        let (elapsed_ms, outcomes) = sync_guest_clocks(std::slice::from_ref(&vm));
+        // (3) set_clock was actually invoked with the fresh timestamp.
         assert!(
-            elapsed_ms < 30_000,
-            "sync_guest_clocks took {elapsed_ms}ms, expected < 30s"
+            set_clock_called.load(Ordering::SeqCst),
+            "set_clock was never called"
         );
+        let recorded_ts = set_clock_ts.load(Ordering::SeqCst);
         assert_eq!(
-            outcomes.len(),
-            1,
-            "expected 1 clock sync outcome, got {}",
-            outcomes.len()
+            recorded_ts, now_at,
+            "set_clock was invoked with ts={recorded_ts}, but `now()` \
+             returned {now_at} — the timestamp passed to the clock-setter \
+             must be the one captured after ping"
         );
-        assert!(
-            matches!(&outcomes[0], ClockSyncOutcome::Synced { child_index: 0 }),
-            "expected Synced{{child_index: 0}}, got {:?}",
-            outcomes[0]
-        );
-
-        // The key assertion: the guest clock must match host wall time
-        // CLOSELY. A fresh timestamp (captured after ping) yields near-zero
-        // drift; a stale timestamp (captured before the poll) would drift by
-        // however long the agent took to come up.
-        let host_time = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .expect("host time before epoch")
-            .as_secs();
-
-        let fixed_resp = exec_at(
-            &addr,
-            vec!["date".into(), "-u".into(), "+%s".into()],
-            Duration::from_secs(10),
-        )
-        .expect("exec date to read synced clock");
-        let fixed_time: u64 = fixed_resp
-            .stdout
-            .trim()
-            .parse()
-            .expect("parse synced guest time");
-
-        let drift = host_time.abs_diff(fixed_time);
-        assert!(
-            drift <= 3,
-            "guest clock drifts {drift}s from host after sync_guest_clocks \
-             (host={host_time}, guest={fixed_time}) — the timestamp must be \
-             captured fresh after ping, not before the poll"
-        );
-
-        drop(vm);
     }
 }
