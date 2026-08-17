@@ -1019,7 +1019,8 @@ fn sync_guest_clocks(children: &[Vm]) -> (u128, Vec<ClockSyncOutcome>) {
                 }
             };
 
-            sync_one_child_clock(ping, now, set_clock)
+            sync_one_child_clock(ping, now, set_clock, CLOCK_SYNC_AGENT_TIMEOUT)
+                .map_err(|e| e.context(format!("guest agent at {addr} did not come up")))
         }));
     }
 
@@ -1098,30 +1099,34 @@ fn sync_guest_clocks(children: &[Vm]) -> (u128, Vec<ClockSyncOutcome>) {
 /// # Arguments
 ///
 /// - `ping` — readiness probe. Called repeatedly until it returns `Ok`
-///   or `CLOCK_SYNC_AGENT_TIMEOUT` elapses. In production this polls
-///   the guest agent at `GUEST_AGENT_ADDR`; in tests it is a
-///   deterministic closure that fails for a fixed duration then
-///   succeeds, so the induced poll delay exceeds the accepted clock
-///   drift and the timestamp-freshness assertion is meaningful.
+///   or `timeout` elapses. In production this polls the guest agent at
+///   `GUEST_AGENT_ADDR`; in tests it is a deterministic closure that
+///   fails for a fixed duration then succeeds, so the induced poll delay
+///   exceeds the accepted clock drift and the timestamp-freshness
+///   assertion is meaningful.
 /// - `now` — timestamp source (host wall time, seconds since UNIX
 ///   epoch). Injected so tests can pin time.
 /// - `set_clock` — invokes `date -s @<ts>` via the guest agent. In
 ///   tests this records the timestamp passed so the test can assert
 ///   freshness.
+/// - `timeout` — maximum time to wait for `ping` to succeed. Injected
+///   so the timeout path can be unit-tested without waiting the full
+///   10-second production budget.
 fn sync_one_child_clock(
     mut ping: impl FnMut() -> Result<()>,
     now: impl Fn() -> u64,
     set_clock: impl FnOnce(u64) -> Result<()>,
+    timeout: Duration,
 ) -> Result<()> {
-    let deadline = Instant::now() + CLOCK_SYNC_AGENT_TIMEOUT;
+    let deadline = Instant::now() + timeout;
     loop {
         if ping().is_ok() {
             break;
         }
         if Instant::now() >= deadline {
             bail!(
-                "guest agent did not respond within {}s",
-                CLOCK_SYNC_AGENT_TIMEOUT.as_secs()
+                "did not respond within {}s",
+                timeout.as_secs()
             );
         }
         thread::sleep(Duration::from_millis(200));
@@ -3533,7 +3538,7 @@ mod tests {
         };
 
         let poll_start = Instant::now();
-        sync_one_child_clock(ping, now, set_clock)
+        sync_one_child_clock(ping, now, set_clock, CLOCK_SYNC_AGENT_TIMEOUT)
             .expect("sync_one_child_clock should succeed once the probe is ready");
         let poll_elapsed = poll_start.elapsed();
 
@@ -3597,6 +3602,135 @@ mod tests {
             "set_clock was invoked with ts={recorded_ts}, but `now()` \
              returned {now_at} — the timestamp passed to the clock-setter \
              must be the one captured after ping"
+        );
+    }
+
+    /// Unit test: `sync_one_child_clock` bails with a timeout error when the
+    /// readiness probe never succeeds within the timeout. Covers the timeout
+    /// path flagged by the testing/reliability/adversarial reviewers — without
+    /// this, only the `#[ignore]` integration tests exercised it, and the
+    /// 10-second production timeout made a dedicated unit test impractical.
+    ///
+    /// The timeout is injected (500ms) so the test runs fast and
+    /// deterministically. It also asserts that `now()` and `set_clock` are
+    /// never called on the timeout path (no point capturing a timestamp or
+    /// setting the clock if the agent never came up).
+    #[test]
+    fn sync_one_child_clock_times_out_when_probe_never_succeeds() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::sync::Arc;
+
+        let now_called = Arc::new(AtomicBool::new(false));
+        let set_clock_called = Arc::new(AtomicBool::new(false));
+        let ping_calls = Arc::new(AtomicU64::new(0));
+
+        // Probe that always fails and counts how many times it was polled.
+        let ping_calls_cl = ping_calls.clone();
+        let ping = move || -> Result<()> {
+            ping_calls_cl.fetch_add(1, Ordering::SeqCst);
+            bail!("agent never ready")
+        };
+
+        let now_called_cl = now_called.clone();
+        let now = || {
+            now_called_cl.store(true, Ordering::SeqCst);
+            0
+        };
+
+        let set_clock_called_cl = set_clock_called.clone();
+        let set_clock = move |_ts: u64| {
+            set_clock_called_cl.store(true, Ordering::SeqCst);
+            Ok(())
+        };
+
+        // Inject a short timeout so the test doesn't wait 10s.
+        let timeout = Duration::from_millis(500);
+        let start = Instant::now();
+        let result = sync_one_child_clock(ping, now, set_clock, timeout);
+        let elapsed = start.elapsed();
+
+        // The call must error with a timeout message.
+        let err = result.expect_err("expected a timeout error");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("did not respond within"),
+            "timeout error should mention the timeout, got: {msg}"
+        );
+        assert!(
+            msg.contains("0s") || msg.contains("500ms"),
+            "timeout error should reflect the injected sub-second timeout, \
+             got: {msg}"
+        );
+
+        // It must have polled at least once.
+        assert!(
+            ping_calls.load(Ordering::SeqCst) >= 1,
+            "ping was never called"
+        );
+
+        // On the timeout path, now() and set_clock must NOT be called — there
+        // is no point capturing a timestamp or setting the clock if the agent
+        // never came up.
+        assert!(
+            !now_called.load(Ordering::SeqCst),
+            "now() must not be called on the timeout path"
+        );
+        assert!(
+            !set_clock_called.load(Ordering::SeqCst),
+            "set_clock must not be called on the timeout path"
+        );
+
+        // The elapsed time should be at least the timeout (minus a small
+        // tolerance for scheduling), confirming the loop actually waited.
+        assert!(
+            elapsed >= timeout.saturating_sub(Duration::from_millis(50)),
+            "elapsed {:?} is less than the timeout {:?} — the loop did not \
+             wait for the deadline",
+            elapsed,
+            timeout
+        );
+    }
+
+    /// Unit test: `sync_one_child_clock` propagates a `set_clock` failure.
+    /// Covers the set_clock-failure path flagged by the
+    /// testing/reliability/adversarial reviewers. The probe succeeds
+    /// immediately, `now()` is captured, but `set_clock` returns an error —
+    /// that error must propagate verbatim and `now()` must have been called
+    /// (the timestamp was captured before the failed set).
+    #[test]
+    fn sync_one_child_clock_propagates_set_clock_failure() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let now_called = Arc::new(AtomicBool::new(false));
+
+        // Probe succeeds immediately.
+        let ping = || Ok(());
+
+        let now_called_cl = now_called.clone();
+        let now = || {
+            now_called_cl.store(true, Ordering::SeqCst);
+            1_700_000_000 // deterministic fixed timestamp
+        };
+
+        // Clock-setter always fails.
+        let set_clock = |_ts: u64| {
+            bail!("date -s exited with 1: operation not permitted")
+        };
+
+        let result = sync_one_child_clock(ping, now, set_clock, CLOCK_SYNC_AGENT_TIMEOUT);
+
+        let err = result.expect_err("expected set_clock failure to propagate");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("date -s exited with 1"),
+            "set_clock error should propagate verbatim, got: {msg}"
+        );
+
+        // now() must have been called (timestamp captured before set_clock).
+        assert!(
+            now_called.load(Ordering::SeqCst),
+            "now() must be called before set_clock, even when set_clock fails"
         );
     }
 }
