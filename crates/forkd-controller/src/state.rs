@@ -323,12 +323,15 @@ impl Registry {
     /// the allocator may still collide with them — the caller should
     /// log the failure count and the operator should investigate.
     pub(crate) fn kill_orphans(&self) -> Result<KillOrphansResult> {
-        let orphans: Vec<(String, u32)> = {
+        // Collect orphans with their recorded durable identity (start time).
+        // The lock is dropped before any kill so the (bounded) wait_for_death
+        // poll never holds the registry mutex.
+        let orphans: Vec<(String, u32, Option<u64>)> = {
             let g = self.inner.lock();
             g.sandboxes
                 .iter()
                 .filter_map(|(id, sb)| match sb.pid {
-                    Some(pid) if pid_alive(pid) => Some((id.clone(), pid)),
+                    Some(pid) if pid_alive(pid) => Some((id.clone(), pid, sb.proc_starttime)),
                     _ => None,
                 })
                 .collect()
@@ -337,66 +340,156 @@ impl Registry {
         let mut killed = 0usize;
         let mut pruned_stale = 0usize;
         let mut kill_failed = 0usize;
-        let mut skip_ids: Vec<String> = Vec::new();
 
-        for (id, pid) in orphans {
-            if pid_is_firecracker(pid) {
-                tracing::warn!(
-                    sandbox_id = %id,
-                    pid = pid,
-                    "killing orphaned Firecracker process on startup"
-                );
-                match kill_pid(pid) {
-                    Ok(()) => {
-                        // Wait for the process to actually exit (bounded).
-                        // SIGKILL is asynchronous; a D-state process can
-                        // hold netns/tap resources past the kill return.
-                        if wait_for_death(pid, std::time::Duration::from_secs(5)) {
+        for (id, pid, recorded_starttime) in orphans {
+            // Primary identity check: compare the live process start time
+            // against the one recorded at registration. This is the
+            // durable identity that survives PID reuse — `comm` alone
+            // is spoofable and cannot distinguish two Firecracker
+            // processes that happen to share a PID over time.
+            match process_identity_matches(pid, recorded_starttime) {
+                IdentityCheck::Match => {
+                    // Same process (start time matches). Open a pidfd
+                    // NOW, after the identity check, so the signal is
+                    // pinned to the verified process. This closes the
+                    // TOCTOU window: even if the PID is reused between
+                    // here and pidfd_send_signal, the fd targets the
+                    // original process identity, not whatever currently
+                    // holds the PID.
+                    let pidfd = match pidfd_open(pid) {
+                        Ok(fd) => fd,
+                        Err(e) if e.raw_os_error() == Some(libc::ESRCH) => {
+                            // Benign race: process exited between the
+                            // identity check and pidfd_open. Safe to prune.
+                            tracing::debug!(
+                                sandbox_id = %id,
+                                pid = pid,
+                                "orphan exited before pidfd_open (ESRCH); pruning registry entry"
+                            );
                             self.inner.lock().sandboxes.remove(&id);
-                            killed += 1;
-                        } else {
+                            pruned_stale += 1;
+                            continue;
+                        }
+                        Err(e) => {
+                            // pidfd_open can fail with EINVAL/ENOSYS on
+                            // kernels < 5.3. Fail closed: keep the entry
+                            // so the operator can investigate, rather than
+                            // risk killing the wrong process via kill(2).
                             tracing::error!(
                                 sandbox_id = %id,
                                 pid = pid,
-                                "orphaned Firecracker did not exit within 5s of SIGKILL;                                  keeping registry entry to prevent resource collision"
+                                error = %e,
+                                "pidfd_open failed; keeping registry entry to prevent unsafe kill"
                             );
                             kill_failed += 1;
-                            skip_ids.push(id);
+                            continue;
                         }
-                    }
-                    Err(e) if e.raw_os_error() == Some(libc::ESRCH) => {
-                        // Process already dead (benign TOCTOU race between
-                        // pid_alive and kill_pid) — safe to prune.
-                        tracing::debug!(
-                            sandbox_id = %id,
-                            pid = pid,
-                            "orphan already exited (ESRCH); pruning registry entry"
-                        );
-                        self.inner.lock().sandboxes.remove(&id);
-                        pruned_stale += 1;
-                    }
-                    Err(e) => {
-                        // Real kill failure (EPERM, etc.) — do NOT prune.
-                        // The orphan may still be alive holding resources;
-                        // pruning would recreate the exact bug #298 fixes.
+                    };
+
+                    // Secondary confirmation: the comm name should still
+                    // be firecracker. This is NOT a security boundary (comm
+                    // is spoofable) — it catches corrupted state.json that
+                    // somehow recorded a valid-looking start time for a
+                    // non-firecracker process. If it fails, fail closed.
+                    if !comm_is_firecracker(pid) {
+                        let _ = unsafe { libc::close(pidfd) };
                         tracing::error!(
                             sandbox_id = %id,
                             pid = pid,
-                            error = %e,
-                            "failed to kill orphaned Firecracker process;                              keeping registry entry to prevent resource collision"
+                            "start time matched but comm is not firecracker; \
+                             keeping registry entry (possible state corruption)"
                         );
                         kill_failed += 1;
-                        skip_ids.push(id);
+                        continue;
                     }
+
+                    tracing::warn!(
+                        sandbox_id = %id,
+                        pid = pid,
+                        "killing orphaned Firecracker process on startup (pidfd signal, identity verified)"
+                    );
+                    match pidfd_send_kill(pidfd) {
+                        Ok(()) => {
+                            // Wait for the process to actually exit (bounded).
+                            // SIGKILL is asynchronous; a D-state process can
+                            // hold netns/tap resources past the kill return.
+                            if wait_for_death(pid, std::time::Duration::from_secs(5)) {
+                                self.inner.lock().sandboxes.remove(&id);
+                                killed += 1;
+                            } else {
+                                tracing::error!(
+                                    sandbox_id = %id,
+                                    pid = pid,
+                                    "orphaned Firecracker did not exit within 5s of SIGKILL; \
+                                     keeping registry entry to prevent resource collision"
+                                );
+                                kill_failed += 1;
+                            }
+                        }
+                        Err(e) if e.raw_os_error() == Some(libc::ESRCH) => {
+                            // Process exited between pidfd_open and the
+                            // signal (benign). Safe to prune.
+                            tracing::debug!(
+                                sandbox_id = %id,
+                                pid = pid,
+                                "orphan exited before signal (ESRCH); pruning registry entry"
+                            );
+                            self.inner.lock().sandboxes.remove(&id);
+                            pruned_stale += 1;
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                sandbox_id = %id,
+                                pid = pid,
+                                error = %e,
+                                "pidfd_send_signal failed; keeping registry entry to prevent resource collision"
+                            );
+                            kill_failed += 1;
+                        }
+                    }
+                    // Always close the pidfd; leak protection on every path.
+                    let _ = unsafe { libc::close(pidfd) };
                 }
-            } else {
-                tracing::warn!(
-                    sandbox_id = %id,
-                    pid = pid,
-                    "PID no longer belongs to Firecracker (PID reuse); pruning stale registry entry"
-                );
-                self.inner.lock().sandboxes.remove(&id);
-                pruned_stale += 1;
+                IdentityCheck::PidReuse => {
+                    // PID is alive but the start time differs: the original
+                    // Firecracker exited and the PID was recycled by the
+                    // kernel for an unrelated process. Do NOT kill — prune
+                    // the stale registry entry only.
+                    tracing::warn!(
+                        sandbox_id = %id,
+                        pid = pid,
+                        "PID reused (start time mismatch); pruning stale registry entry without killing"
+                    );
+                    self.inner.lock().sandboxes.remove(&id);
+                    pruned_stale += 1;
+                }
+                IdentityCheck::Dead => {
+                    // Process is gone (no /proc/<pid>). Prune the entry.
+                    tracing::debug!(
+                        sandbox_id = %id,
+                        pid = pid,
+                        "orphan already exited; pruning registry entry"
+                    );
+                    self.inner.lock().sandboxes.remove(&id);
+                    pruned_stale += 1;
+                }
+                IdentityCheck::Unknown => {
+                    // No recorded start time (old state.json) OR the live
+                    // start time could not be read OR off-Linux. Fail
+                    // closed: do NOT kill (we can't prove the PID is ours),
+                    // and do NOT silently prune (the entry may be for a
+                    // legitimately-recoverable sandbox). Keep the entry so
+                    // the operator can investigate; the startup abort
+                    // check on kill_failed > 0 will surface this.
+                    tracing::warn!(
+                        sandbox_id = %id,
+                        pid = pid,
+                        recorded_starttime = ?recorded_starttime,
+                        "cannot verify process identity (no recorded start time, \
+                         /proc unreadable, or off-Linux); keeping registry entry (fail closed)"
+                    );
+                    kill_failed += 1;
+                }
             }
         }
 
@@ -439,34 +532,174 @@ fn pid_alive(_pid: u32) -> bool {
     true
 }
 
-/// Verify that a PID belongs to a Firecracker process by reading
-/// `/proc/<pid>/comm`. Guards against PID reuse: if the original
-/// Firecracker process died and the PID was recycled by the OS for
-/// a different process, we don't want to kill an unrelated process.
+// ----------------------------------------------------------------
+// Durable process identity for orphan recovery (review #299 r6).
+// ----------------------------------------------------------------
+//
+// `comm == "firecracker"` alone is NOT an identity check: `comm` is
+// settable via `prctl(PR_SET_NAME)`, and a Firecracker that exits can
+// have its PID recycled by *another* Firecracker before recovery runs.
+// Killing on a comm match alone is a cross-tenant DoS vector and a
+// same-name PID-reuse regression.
+//
+// The durable identity is the process start time (field 22 of
+// `/proc/<pid>/stat`, in clock ticks since boot). It is captured at VM
+// registration and persisted in `SandboxInfo::proc_starttime`. On
+// controller restart, `process_identity_matches` compares the live
+// start time against the recorded one. A mismatch means the recorded
+// process has exited and the PID was reused — prune the stale entry,
+// do NOT kill. The TOCTOU window between the identity check and the
+// signal is closed by signalling through a pidfd opened AFTER the
+// identity check: the pidfd is pinned to the process that owned the
+// PID at `pidfd_open` time, so even if the PID is reused between the
+// check and the signal, `pidfd_send_signal` targets the original
+// (now possibly-reused) process identity, not whatever currently
+// holds the PID. (Linux 5.3+; raw `libc::syscall` because libc 0.2.x
+// exposes `SYS_pidfd_open`/`SYS_pidfd_send_signal` but not named fns.)
+//
+// Off-Linux stubs return identity-unknown so `kill_orphans` prunes
+// without killing (the safe path for dev boxes).
+
+/// Outcome of verifying a recorded PID's identity on recovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdentityCheck {
+    /// Live process start time matches the recorded one — same process,
+    /// safe to signal through the pidfd.
+    Match,
+    /// PID is alive but the start time differs — the original process
+    /// exited and the PID was reused. Prune the stale entry; do NOT kill.
+    PidReuse,
+    /// The process is gone (no `/proc/<pid>`). Prune the stale entry.
+    Dead,
+    /// Identity could not be verified (no recorded start time, or the
+    /// live start time could not be read, or off-Linux). Fail closed:
+    /// the caller decides between a conservative comm-only kill or a
+    /// prune-without-kill depending on policy.
+    Unknown,
+}
+
+/// Read field 22 (starttime, clock ticks since boot) from
+/// `/proc/<pid>/stat`. Returns `None` if the process is gone or the
+/// file cannot be parsed.
 ///
-/// Note: `comm` is settable via `prctl(PR_SET_NAME)` and is not an
-/// identity guarantee. On a multi-tenant host where another process
-/// could set its name to "firecracker", this check is a best-effort
-/// guard, not a security boundary. The TOCTOU window between this
-/// check and `kill_pid` is acknowledged — `pidfd_open` +
-/// `pidfd_send_signal` would close it entirely (Linux 5.3+).
+/// The `comm` field (field 2) is enclosed in parentheses and may
+/// itself contain spaces and parentheses, so naive whitespace
+/// splitting is wrong. The robust parse: split at the LAST `)` in the
+/// line, then tokenize the remainder; starttime is the 20th token
+/// after the `)` (field 22 counting `pid` + `comm`).
 #[cfg(target_os = "linux")]
-/// Check whether a PID belongs to a Firecracker process by reading
-/// `/proc/<pid>/comm`. Uses exact match (`== "firecracker"`) to avoid
-/// false positives from processes whose names contain the substring.
+pub(crate) fn read_proc_starttime(pid: u32) -> Option<u64> {
+    if pid <= 1 {
+        return None;
+    }
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // Field 2 (`comm`) is in parentheses and can contain spaces/parens.
+    // Everything after the closing paren of comm is whitespace-separated.
+    let after_comm = stat.rfind(')')?;
+    let rest = &stat[after_comm + 1..];
+    // rest begins with a space then: state(3) ppid(4) pgrp(5) ... starttime(22)
+    // That is 20 fields after `)`: state, ppid, pgrp, session, tty_nr,
+    // tpgid, flags, minflt, cminflt, majflt, cmajflt, utime, stime,
+    // cutime, cstime, priority, nice, num_threads, itrealvalue,
+    // starttime  → index 19 (0-based) in the whitespace-split of `rest`.
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    fields.get(19).and_then(|t| t.parse::<u64>().ok())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn read_proc_starttime(_pid: u32) -> Option<u64> {
+    None
+}
+
+/// Compare a recorded process identity against the live process at the
+/// same PID. On Linux this is the start-time comparison; off-Linux it is
+/// always `Unknown` (no `/proc` to read).
+#[cfg(target_os = "linux")]
+fn process_identity_matches(pid: u32, recorded_starttime: Option<u64>) -> IdentityCheck {
+    if pid <= 1 {
+        return IdentityCheck::Unknown;
+    }
+    let Some(recorded) = recorded_starttime else {
+        // No recorded identity (old state.json written before this field
+        // existed). We cannot prove the live PID is ours — fail closed.
+        return IdentityCheck::Unknown;
+    };
+    let path = format!("/proc/{pid}");
+    if !std::path::Path::new(&path).exists() {
+        return IdentityCheck::Dead;
+    }
+    match read_proc_starttime(pid) {
+        Some(live) if live == recorded => IdentityCheck::Match,
+        Some(_live) => IdentityCheck::PidReuse,
+        None => IdentityCheck::Unknown,
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_identity_matches(_pid: u32, _recorded_starttime: Option<u64>) -> IdentityCheck {
+    IdentityCheck::Unknown
+}
+
+/// Open a pidfd for a live process (Linux 5.3+). Used to close the
+/// TOCTOU window between `process_identity_matches` and the signal:
+/// the pidfd is pinned to the process that owned the PID at open time,
+/// so a PID reuse between check and signal cannot redirect the kill.
 ///
-/// **Limitation:** this is NOT complete PID-reuse protection. If a
-/// Firecracker process exits and its PID is reused by another
-/// Firecracker process before this check runs, the comm match passes
-/// and the new (legitimate) process would be killed. A robust fix
-/// would use pidfd signaling plus durable identity validation
-/// (process start time recorded with the registry entry at spawn
-/// time, compared on startup). That is tracked as a follow-up — the
-/// comm check is a defense-in-depth heuristic, not a guarantee.
+/// Returns a raw fd on success, or an `io::Error` on failure. The
+/// caller owns the fd and must close it (dropping is fine — it's a
+/// plain fd, not a Rust-owned handle).
 #[cfg(target_os = "linux")]
-fn pid_is_firecracker(pid: u32) -> bool {
-    // Defensive guard against pid 0/1 (defense-in-depth for corrupted
-    // state.json). Real firecracker PIDs are always > 1.
+fn pidfd_open(pid: u32) -> std::io::Result<std::os::fd::RawFd> {
+    // libc 0.2.x exposes the syscall numbers but not named functions.
+    let ret = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as i32, 0u32) };
+    if ret < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(ret as std::os::fd::RawFd)
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn pidfd_open(_pid: u32) -> std::io::Result<std::os::fd::RawFd> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "pidfd_open is Linux-only",
+    ))
+}
+
+/// Send SIGKILL through a pidfd (Linux 5.3+). Unlike `kill(pid, ...)`,
+/// this targets the process the pidfd was pinned to at `pidfd_open`
+/// time, eliminating the PID-reuse TOCTOU window entirely.
+#[cfg(target_os = "linux")]
+fn pidfd_send_kill(pidfd: std::os::fd::RawFd) -> std::io::Result<()> {
+    let ret = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            pidfd,
+            libc::SIGKILL,
+            std::ptr::null::<libc::siginfo_t>(),
+            0u32,
+        )
+    };
+    if ret < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn pidfd_send_kill(_pidfd: std::os::fd::RawFd) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// Defensive `comm`-name check, used ONLY as a secondary confirmation
+/// after the primary start-time identity check passes. This is NOT a
+/// security boundary (`comm` is spoofable via `prctl`); it exists to
+/// catch corrupted state.json that somehow records a valid-looking
+/// start time for the wrong process. Uses exact `== "firecracker"`.
+#[cfg(target_os = "linux")]
+fn comm_is_firecracker(pid: u32) -> bool {
     if pid <= 1 {
         return false;
     }
@@ -476,31 +709,8 @@ fn pid_is_firecracker(pid: u32) -> bool {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn pid_is_firecracker(_pid: u32) -> bool {
-    // Off-Linux: can't verify via /proc; return false so
-    // kill_orphans prunes the entry without sending a signal.
+fn comm_is_firecracker(_pid: u32) -> bool {
     false
-}
-
-/// Send SIGKILL to a process by PID. Uses libc::kill directly
-/// (we don't have a std::process::Child handle for orphaned PIDs).
-///
-/// SAFETY: `pid` is a live Linux PID verified by `pid_is_firecracker`;
-/// `SIGKILL` is a valid signal constant; `kill(2)` is sound for any
-/// `pid_t` value (returns ESRCH if the process doesn't exist).
-#[cfg(target_os = "linux")]
-fn kill_pid(pid: u32) -> std::io::Result<()> {
-    let ret = unsafe { libc::kill(pid as i32, libc::SIGKILL) };
-    if ret != 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn kill_pid(_pid: u32) -> std::io::Result<()> {
-    Ok(())
 }
 
 /// Poll for process death by checking `/proc/<pid>` disappearance.
@@ -539,6 +749,7 @@ mod tests {
             netns: Some("forkd-child-1".into()),
             guest_addr: "10.42.0.2:8888".into(),
             created_at_unix: 1,
+            proc_starttime: None,
             pid: Some(99999999),
             memory_limit_mib: None,
             has_branched: false,
@@ -690,15 +901,23 @@ mod tests {
             reloaded.list_sandboxes().len(),
             WORKERS * MUTATIONS_PER_WORKER
         );
+    }
+
+    #[test]
     fn kill_orphans_prunes_alive_pid_entries() {
         let td = TempDir::new().unwrap();
         let path = td.path().join("state.json");
         let r = Registry::load_or_init(&path).unwrap();
 
-        // Insert a sandbox with an alive PID (use our own process PID).
-        // On Linux, pid_is_firecracker will return false (we're not
-        // firecracker), so the entry is pruned without killing.
-        // On non-Linux, pid_is_firecracker always returns false.
+        // Insert a sandbox with an alive PID (our own process PID) but a
+        // DELIBERATELY MISMATCHED start time. This simulates PID reuse:
+        // the original Firecracker exited, the kernel recycled the PID
+        // for an unrelated process (us), and the recorded start time no
+        // longer matches. The durable-identity check must detect this
+        // and prune the stale entry WITHOUT killing the unrelated process.
+        //
+        // The bogus start time (u64::MAX) cannot match any real process
+        // (real start times are small clock-tick counts since boot).
         r.insert_sandbox(SandboxInfo {
             id: "sb-orphan".into(),
             snapshot_tag: "py".into(),
@@ -706,6 +925,7 @@ mod tests {
             guest_addr: "10.42.0.2:8888".into(),
             created_at_unix: 1,
             pid: Some(std::process::id()),
+            proc_starttime: Some(u64::MAX), // mismatched → PidReuse
             memory_limit_mib: None,
             has_branched: false,
             last_branch_memory_path: None,
@@ -715,7 +935,8 @@ mod tests {
 
         // Insert a sandbox with a dead PID (99999999 — not alive on Linux).
         // On macOS, pid_alive always returns true, so this entry survives
-        // reconcile() and is pruned by kill_orphans() instead.
+        // reconcile() and is pruned by kill_orphans() instead (as Dead on
+        // Linux, or PidReuse via the mismatched start time on macOS).
         r.insert_sandbox(SandboxInfo {
             id: "sb-dead".into(),
             snapshot_tag: "py".into(),
@@ -723,6 +944,7 @@ mod tests {
             guest_addr: "10.42.0.3:8888".into(),
             created_at_unix: 2,
             pid: Some(99999999),
+            proc_starttime: Some(u64::MAX), // mismatched → PidReuse
             memory_limit_mib: None,
             has_branched: false,
             last_branch_memory_path: None,
@@ -734,12 +956,107 @@ mod tests {
         // where pid_alive always returns true).
         let _pruned = r.reconcile().unwrap();
 
-        // kill_orphans prunes all remaining entries (alive PID but
-        // not firecracker → pruned without killing).
+        // kill_orphans prunes all remaining entries via the durable
+        // identity check (start time mismatch → PidReuse → prune stale).
         let result = r.kill_orphans().unwrap();
-        // At least the alive-PID entry is pruned.
-        assert!(result.killed + result.pruned_stale >= 1);
+        // At least one entry is pruned (the alive-PID one on Linux; both
+        // on macOS where reconcile leaves both).
+        assert!(result.killed + result.pruned_stale >= 1, "nothing pruned");
+        // Nothing was killed — the mismatched start time means we never
+        // believed the PID was our Firecracker, so we pruned, not killed.
+        assert_eq!(result.killed, 0, "should not kill on identity mismatch");
         // All sandbox entries are gone.
+        assert!(r.list_sandboxes().is_empty());
+    }
+
+    /// New: an alive-PID entry with NO recorded start time (old state.json
+    /// written before proc_starttime existed) must FAIL CLOSED — the entry
+    // is kept and kill_failed is incremented, so the caller aborts startup
+    // rather than risking killing an unrelated process. This is the
+    // cross-platform (no /proc required) contract test for the fail-closed
+    // behavior the reviewer insisted on.
+    #[test]
+    fn kill_orphans_fails_closed_on_unknown_identity() {
+        let td = TempDir::new().unwrap();
+        let path = td.path().join("state.json");
+        let r = Registry::load_or_init(&path).unwrap();
+
+        // Alive PID (our own), no recorded start time → Unknown → fail closed.
+        r.insert_sandbox(SandboxInfo {
+            id: "sb-unknown".into(),
+            snapshot_tag: "py".into(),
+            netns: Some("forkd-child-1".into()),
+            guest_addr: "10.42.0.2:8888".into(),
+            created_at_unix: 1,
+            pid: Some(std::process::id()),
+            proc_starttime: None, // old state.json — identity unknown
+            memory_limit_mib: None,
+            has_branched: false,
+            last_branch_memory_path: None,
+            branch_count: 0,
+        })
+        .unwrap();
+
+        let result = r.kill_orphans().unwrap();
+        // Fail closed: nothing killed, nothing pruned, kill_failed incremented.
+        assert_eq!(result.killed, 0, "must not kill with unknown identity");
+        assert_eq!(
+            result.pruned_stale, 0,
+            "must not prune with unknown identity"
+        );
+        assert_eq!(
+            result.kill_failed, 1,
+            "must fail-closed on unknown identity"
+        );
+        // The entry is KEPT so the operator can investigate.
+        assert_eq!(
+            r.list_sandboxes().len(),
+            1,
+            "entry must be retained on unknown identity"
+        );
+    }
+
+    /// Regression for the same-name Firecracker PID-reuse attack the
+    /// reviewer flagged: a Firecracker exits, the kernel recycles its PID
+    /// for ANOTHER Firecracker (same comm name), and the recorded start
+    /// time no longer matches. The old comm-only check would kill the
+    /// legitimate new Firecracker; the durable-identity check must detect
+    /// the start-time mismatch and prune the stale entry WITHOUT killing.
+    ///
+    /// We simulate this by recording our own PID (alive) with a bogus
+    /// start time. On Linux `comm_is_firecracker` would return false for
+    /// us, but the PRIMARY check (start time) fires first and returns
+    /// PidReuse before comm is ever consulted — so the entry is pruned as
+    /// stale regardless of comm. This is the same-name reuse regression:
+    /// the test fails if kill_orphans ever relies on comm alone.
+    #[test]
+    fn kill_orphans_prunes_same_name_pid_reuse_without_killing() {
+        let td = TempDir::new().unwrap();
+        let path = td.path().join("state.json");
+        let r = Registry::load_or_init(&path).unwrap();
+
+        r.insert_sandbox(SandboxInfo {
+            id: "sb-reused".into(),
+            snapshot_tag: "py".into(),
+            netns: Some("forkd-child-1".into()),
+            guest_addr: "10.42.0.2:8888".into(),
+            created_at_unix: 1,
+            pid: Some(std::process::id()),
+            proc_starttime: Some(0), // real start time is > 0; 0 cannot match
+            memory_limit_mib: None,
+            has_branched: false,
+            last_branch_memory_path: None,
+            branch_count: 0,
+        })
+        .unwrap();
+
+        let result = r.kill_orphans().unwrap();
+        // The start-time mismatch (0 vs the real start time) must yield
+        // PidReuse → pruned_stale, NOT killed. This is the crux: even if
+        // comm were "firecracker", the mismatched start time prevents
+        // the kill.
+        assert_eq!(result.killed, 0, "must not kill on start-time mismatch");
+        assert!(result.pruned_stale >= 1, "must prune stale on PID reuse");
         assert!(r.list_sandboxes().is_empty());
     }
 
@@ -749,7 +1066,8 @@ mod tests {
         let path = td.path().join("state.json");
         let r = Registry::load_or_init(&path).unwrap();
 
-        // Insert a sandbox with an alive PID.
+        // Insert a sandbox with an alive PID and a MISMATCHED start time
+        // so the durable-identity check yields PidReuse → pruned (not killed).
         r.insert_sandbox(SandboxInfo {
             id: "sb-1".into(),
             snapshot_tag: "py".into(),
@@ -757,6 +1075,7 @@ mod tests {
             guest_addr: "10.42.0.2:8888".into(),
             created_at_unix: 1,
             pid: Some(std::process::id()),
+            proc_starttime: Some(u64::MAX), // mismatched → PidReuse
             memory_limit_mib: None,
             has_branched: false,
             last_branch_memory_path: None,
@@ -779,9 +1098,10 @@ mod tests {
         })
         .unwrap();
 
-        // kill_orphans kills the sandbox and marks the workspace Stale.
+        // kill_orphans prunes the stale sandbox (PID reuse) and marks the
+        // workspace Stale. Nothing is killed (identity mismatch).
         let result = r.kill_orphans().unwrap();
-        assert_eq!(result.killed, 0); // not firecracker → not killed
+        assert_eq!(result.killed, 0); // identity mismatch → not killed
         assert_eq!(result.pruned_stale, 1); // pruned as stale
         assert!(r.list_sandboxes().is_empty());
 
@@ -816,6 +1136,7 @@ mod tests {
             netns: None,
             guest_addr: "10.42.0.2:8888".into(),
             created_at_unix: 1,
+            proc_starttime: None,
             pid: None,
             memory_limit_mib: None,
             has_branched: false,
@@ -839,7 +1160,8 @@ mod tests {
         let path = td.path().join("state.json");
         let r = Registry::load_or_init(&path).unwrap();
 
-        // Insert a sandbox with an alive PID.
+        // Insert a sandbox with an alive PID and a MISMATCHED start time
+        // so the durable-identity check yields PidReuse → pruned (not killed).
         r.insert_sandbox(SandboxInfo {
             id: "sb-1".into(),
             snapshot_tag: "py".into(),
@@ -847,6 +1169,7 @@ mod tests {
             guest_addr: "10.42.0.2:8888".into(),
             created_at_unix: 1,
             pid: Some(std::process::id()),
+            proc_starttime: Some(u64::MAX), // mismatched → PidReuse
             memory_limit_mib: None,
             has_branched: false,
             last_branch_memory_path: None,
@@ -898,6 +1221,7 @@ mod tests {
             guest_addr: "10.42.0.2:8888".into(),
             created_at_unix: 1,
             pid: Some(std::process::id()),
+            proc_starttime: Some(u64::MAX), // mismatched → PidReuse
             memory_limit_mib: None,
             has_branched: false,
             last_branch_memory_path: None,
@@ -926,6 +1250,7 @@ mod tests {
             netns: Some("forkd-child-1".into()),
             guest_addr: "10.42.0.2:8888".into(),
             created_at_unix: 1,
+            proc_starttime: Some(u64::MAX), // mismatched → PidReuse if it reaches kill_orphans
             pid: Some(99999999),
             memory_limit_mib: None,
             has_branched: false,
@@ -934,7 +1259,7 @@ mod tests {
         })
         .unwrap();
 
-        // Alive PID entry (pruned by kill_orphans).
+        // Alive PID entry (pruned by kill_orphans via PidReuse).
         r.insert_sandbox(SandboxInfo {
             id: "sb-alive".into(),
             snapshot_tag: "py".into(),
@@ -942,6 +1267,7 @@ mod tests {
             guest_addr: "10.42.0.3:8888".into(),
             created_at_unix: 2,
             pid: Some(std::process::id()),
+            proc_starttime: Some(u64::MAX), // mismatched → PidReuse
             memory_limit_mib: None,
             has_branched: false,
             last_branch_memory_path: None,

@@ -306,6 +306,19 @@ pub struct SandboxInfo {
     pub guest_addr: String,
     pub created_at_unix: u64,
     pub pid: Option<u32>,
+    /// Process start time in clock ticks since boot (field 22 of
+    /// `/proc/<pid>/stat`), captured at VM registration. Used on
+    /// controller restart to detect PID reuse: if the recorded PID now
+    /// points to a process with a different start time, the original
+    /// Firecracker has exited and the PID was recycled — we must prune
+    /// the stale registry entry rather than kill an unrelated process.
+    ///
+    /// `#[serde(default)]` keeps existing `state.json` files loadable
+    /// (entries written before this field existed deserialize to
+    /// `None`, which is treated as "identity unknown — verify by
+    /// comm only, fail closed if the check is inconclusive").
+    #[serde(default)]
+    pub proc_starttime: Option<u64>,
     pub memory_limit_mib: Option<u64>,
     /// Set to true once any BRANCH (Full or Diff) has been taken from
     /// this sandbox. Diagnostic flag — phase 1d (v0.3.1) lifted the
