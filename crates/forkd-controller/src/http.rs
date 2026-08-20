@@ -39,6 +39,7 @@ use crate::api::{
     VersionResponse, WorkspaceInfo, WorkspaceStatus,
 };
 use crate::state::Registry;
+use forkd_vmm::ClockSyncOutcome;
 
 const API_VERSION: &str = "v1";
 const BUILD_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -1280,6 +1281,7 @@ async fn create_sandbox(
             // snapshots (see docs/design/diff-snapshots.md). The cost is
             // ~1 bit per page; negligible.
             enable_diff_snapshots: true,
+            sync_guest_clocks: true,
         };
         // Per-snapshot-tag work_dir would clash if two batches of the same tag
         // ran concurrently (e.g. two branches of the same source). Mix the
@@ -1365,12 +1367,24 @@ async fn create_sandbox(
         Err(e) => return server_error(&format!("blocking task panicked: {e}")),
     };
     if prewarm_requested {
+        let clock_failures: Vec<String> = fork_result
+            .clock_sync_outcomes
+            .iter()
+            .filter_map(|o| match o {
+                ClockSyncOutcome::Failed { child_index, error } => {
+                    Some(format!("child {child_index}: {error}"))
+                }
+                _ => None,
+            })
+            .collect();
         tracing::info!(
             tag = %tag,
             n = fork_result.children.len(),
             spawn_ms = fork_result.spawn_ms as u64,
             restore_ms = fork_result.restore_ms as u64,
             prewarm_ms = fork_result.prewarm_ms as u64,
+            clock_sync_ms = fork_result.clock_sync_ms as u64,
+            clock_sync_failures =? clock_failures,
             "sandbox created (prewarmed)"
         );
     }
@@ -2802,6 +2816,7 @@ fn spawn_one_for_workspace(
         prewarm_scratch_dir: None,
         memory_backend: forkd_vmm::MemoryBackend::File,
         enable_diff_snapshots: true,
+        sync_guest_clocks: true,
     };
     let work_dir =
         std::env::temp_dir().join(format!("forkd-workspace-{snapshot_tag}-o{netns_offset}"));
