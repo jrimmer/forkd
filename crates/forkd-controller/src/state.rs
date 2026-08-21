@@ -1650,8 +1650,8 @@ mod tests {
             .expect("parse detached firecracker child PID from sh output");
 
         // Sanity: confirm /proc/<pid>/comm really is "firecracker".
-        let comm = std::fs::read_to_string(format!("/proc/{pid}/comm"))
-            .expect("read /proc/<pid>/comm");
+        let comm =
+            std::fs::read_to_string(format!("/proc/{pid}/comm")).expect("read /proc/<pid>/comm");
         assert_eq!(
             comm.trim(),
             "firecracker",
