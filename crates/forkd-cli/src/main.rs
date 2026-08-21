@@ -1932,8 +1932,12 @@ fn write_rootfs_cache_meta(rootfs: &std::path::Path, image: &str, size_mib: u32)
         forkd_version: env!("CARGO_PKG_VERSION").to_string(),
     };
     let json = serde_json::to_vec_pretty(&meta).context("serialize rootfs cache meta")?;
-    std::fs::write(rootfs_cache_meta_path(rootfs), json)
-        .with_context(|| format!("write rootfs cache meta {}", rootfs_cache_meta_path(rootfs).display()))
+    std::fs::write(rootfs_cache_meta_path(rootfs), json).with_context(|| {
+        format!(
+            "write rootfs cache meta {}",
+            rootfs_cache_meta_path(rootfs).display()
+        )
+    })
 }
 
 /// Decide whether a cached rootfs is safe to reuse as the immutable
@@ -2400,7 +2404,6 @@ fn run_cmd(
                 .with_context(|| format!("write cache meta for {}", rootfs.display()))?;
         }
     }
-    }
 
     // 2. Snapshot a one-off tag.
     let slug: String = image
@@ -2860,8 +2863,13 @@ fn snapshot_cmd(
     // the old snap_dir from the aside copy. The aside dir is cleaned up
     // last, so a crash at any point leaves either the new or the old
     // snapshot intact, never neither.
-    publish_snapshot(&staging_dir, &snap_dir)
-        .with_context(|| format!("publish staging {} → snap_dir {}", staging_dir.display(), snap_dir.display()))?;
+    publish_snapshot(&staging_dir, &snap_dir).with_context(|| {
+        format!(
+            "publish staging {} → snap_dir {}",
+            staging_dir.display(),
+            snap_dir.display()
+        )
+    })?;
     eprintln!("    published snapshot → {}", snap_dir.display());
 
     // Parent VM is dead and the snapshot lives under data_dir; work_dir
@@ -2949,8 +2957,13 @@ fn publish_snapshot(staging: &std::path::Path, snap_dir: &std::path::Path) -> Re
 
     let had_old = snap_dir.exists();
     if had_old {
-        std::fs::rename(snap_dir, &aside)
-            .with_context(|| format!("move old snap_dir {} aside → {}", snap_dir.display(), aside.display()))?;
+        std::fs::rename(snap_dir, &aside).with_context(|| {
+            format!(
+                "move old snap_dir {} aside → {}",
+                snap_dir.display(),
+                aside.display()
+            )
+        })?;
     }
 
     // Commit point: rename staging → snap_dir.
@@ -2968,11 +2981,13 @@ fn publish_snapshot(staging: &std::path::Path, snap_dir: &std::path::Path) -> Re
                 ));
             }
         }
-        return Err(e).with_context(|| format!(
-            "rename staging {} → snap_dir {}",
-            staging.display(),
-            snap_dir.display()
-        ));
+        return Err(e).with_context(|| {
+            format!(
+                "rename staging {} → snap_dir {}",
+                staging.display(),
+                snap_dir.display()
+            )
+        });
     }
 
     // Committed. Drop the old snapshot (best-effort).
@@ -4002,8 +4017,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let rootfs = write_temp_file(dir.path(), "py.ext4", b"fresh rootfs contents");
         write_rootfs_cache_meta(&rootfs, "python:3.12-slim", 512).unwrap();
-        validate_cached_rootfs(&rootfs)
-            .expect("fresh rootfs with matching meta should be trusted");
+        validate_cached_rootfs(&rootfs).expect("fresh rootfs with matching meta should be trusted");
     }
 
     /// Review #295 r6 blocker 2: a missing rootfs file is a cache miss,
@@ -4043,10 +4057,19 @@ mod tests {
         publish_snapshot(&staging, &snap_dir).expect("publish should succeed");
 
         // New snapshot is committed at snap_dir.
-        assert_eq!(std::fs::read(snap_dir.join("snapshot.json")).unwrap(), b"NEW");
-        assert_eq!(std::fs::read(snap_dir.join("rootfs.ext4")).unwrap(), b"NEW-ROOTFS");
+        assert_eq!(
+            std::fs::read(snap_dir.join("snapshot.json")).unwrap(),
+            b"NEW"
+        );
+        assert_eq!(
+            std::fs::read(snap_dir.join("rootfs.ext4")).unwrap(),
+            b"NEW-ROOTFS"
+        );
         // Staging dir is gone (renamed away).
-        assert!(!staging.exists(), "staging dir should be gone after publish");
+        assert!(
+            !staging.exists(),
+            "staging dir should be gone after publish"
+        );
         // No stray aside dir left behind.
         assert_eq!(
             std::fs::read_dir(dir.path()).unwrap().count(),
@@ -4069,7 +4092,10 @@ mod tests {
         publish_snapshot(&staging, &snap_dir).expect("publish to fresh dir should succeed");
 
         assert!(snap_dir.exists());
-        assert_eq!(std::fs::read(snap_dir.join("snapshot.json")).unwrap(), b"NEW");
+        assert_eq!(
+            std::fs::read(snap_dir.join("snapshot.json")).unwrap(),
+            b"NEW"
+        );
         assert!(!staging.exists());
     }
 
@@ -4092,9 +4118,17 @@ mod tests {
         let err = publish_snapshot(&staging, &snap_dir).unwrap_err();
         let msg = format!("{err:#}");
         // The existing snapshot MUST be intact.
-        assert_eq!(std::fs::read(snap_dir.join("snapshot.json")).unwrap(), b"OLD");
-        assert_eq!(std::fs::read(snap_dir.join("rootfs.ext4")).unwrap(), b"OLD-ROOTFS");
-        assert!(msg.contains("staging") || msg.contains("rename"),
-            "should error on missing staging, got: {msg}");
+        assert_eq!(
+            std::fs::read(snap_dir.join("snapshot.json")).unwrap(),
+            b"OLD"
+        );
+        assert_eq!(
+            std::fs::read(snap_dir.join("rootfs.ext4")).unwrap(),
+            b"OLD-ROOTFS"
+        );
+        assert!(
+            msg.contains("staging") || msg.contains("rename"),
+            "should error on missing staging, got: {msg}"
+        );
     }
 }

@@ -249,7 +249,7 @@ pub fn pack(
     let rootfs_filename: Option<String> = rootfs
         .as_ref()
         .and_then(|r| Path::new(&r.target_path).file_name())
-        .map(|s| s.to_string_lossy().into_owned());;
+        .map(|s| s.to_string_lossy().into_owned());
 
     let manifest = Manifest {
         forkd_pack_version: PACK_FORMAT_VERSION_V1,
