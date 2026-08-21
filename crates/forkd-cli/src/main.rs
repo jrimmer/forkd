@@ -1518,7 +1518,7 @@ fn unpack_chain_into(
     Ok(destinations
         .last()
         .cloned()
-        .unwrap_or_else(|| std::path::PathBuf::new()))
+        .unwrap_or_else(std::path::PathBuf::new))
 }
 
 /// Where `forkd pull <owner>/<name>` resolves names to download URLs by
