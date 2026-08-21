@@ -315,8 +315,9 @@ pub struct SandboxInfo {
     ///
     /// `#[serde(default)]` keeps existing `state.json` files loadable
     /// (entries written before this field existed deserialize to
-    /// `None`, which is treated as "identity unknown — verify by
-    /// comm only, fail closed if the check is inconclusive").
+    /// `None`, which is treated as "identity unknown — fail closed:
+    /// keep the entry and increment `kill_failed` rather than risk
+    /// killing an unidentifiable process").
     #[serde(default)]
     pub proc_starttime: Option<u64>,
     pub memory_limit_mib: Option<u64>,

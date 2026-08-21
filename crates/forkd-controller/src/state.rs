@@ -616,8 +616,9 @@ enum IdentityCheck {
     Dead,
     /// Identity could not be verified (no recorded start time, or the
     /// live start time could not be read, or off-Linux). Fail closed:
-    /// the caller decides between a conservative comm-only kill or a
-    /// prune-without-kill depending on policy.
+    /// `kill_orphans` keeps the entry and increments `kill_failed`
+    /// (aborting startup via `check_orphan_kill_result`) rather than
+    /// risk killing an unidentifiable process.
     Unknown,
 }
 
@@ -1501,17 +1502,18 @@ mod tests {
         );
     }
 
-    /// The `Match` kill lifecycle (pidfd_open → start-time re-verification →
-    /// comm check → pidfd_send_kill → wait_for_death → close) has zero
-    /// coverage in the r6 tests — every other test uses a mismatched or
-    /// absent start time so the `Match` arm is never entered. This test
-    /// spawns a real child process, records its TRUE start time, inserts
-    /// a sandbox entry for it, and asserts `kill_orphans` actually kills
-    /// it via the pidfd path and prunes the registry entry. Linux-only
-    /// (pidfd_open + /proc).
+    /// The secondary `comm_is_firecracker` check inside the `Match` arm
+    /// is a defense-in-depth guard against corrupted `state.json` that
+    /// somehow recorded a valid-looking start time for a non-firecracker
+    /// process. This test exercises that fail-closed branch: it spawns a
+    /// real child (`sleep`, whose comm is "sleep"), records its TRUE start
+    /// time so `process_identity_matches` returns `Match`, inserts a
+    /// sandbox entry, and asserts `kill_orphans` does NOT kill the
+    /// non-firecracker process — it keeps the entry and increments
+    /// `kill_failed`. Linux-only (pidfd_open + /proc).
     #[test]
     #[cfg(target_os = "linux")]
-    fn kill_orphans_match_arm_kills_verified_child_via_pidfd() {
+    fn kill_orphans_match_arm_comm_mismatch_fails_closed() {
         use std::process::{Command, Stdio};
         use std::time::Duration;
 
@@ -1519,18 +1521,11 @@ mod tests {
         let path = td.path().join("state.json");
         let r = Registry::load_or_init(&path).unwrap();
 
-        // Spawn a child that sleeps long enough for the test to run.
-        // `sleep 30` is a normal binary whose comm is "sleep", NOT
-        // "firecracker" — so the secondary comm_is_firecracker check will
-        // fail closed (kill_failed) and the entry will be KEPT. This is
-        // the CORRECT behavior for a non-firecracker process even when
-        // the start time matches: we only ever kill verified Firecrackers.
-        //
-        // To exercise the FULL Match kill path we would need a process
-        // named "firecracker"; instead this test asserts the fail-closed
-        // contract at the comm gate: a matching start time alone does NOT
-        // authorize a kill — the comm check must also pass. This is the
-        // defense-in-depth property the security review required.
+        // Spawn a child whose comm is "sleep" (NOT "firecracker").
+        // Its TRUE start time is recorded so `process_identity_matches`
+        // returns `Match` and the pidfd path is entered, but the
+        // secondary `comm_is_firecracker` check then fails closed —
+        // proving a matching start time alone does NOT authorize a kill.
         let mut child = Command::new("sleep")
             .arg("30")
             .stdin(Stdio::null())
@@ -1583,5 +1578,134 @@ mod tests {
         // Give the kernel a moment to reap so wait_for_death-style polls
         // see the process as gone.
         std::thread::sleep(Duration::from_millis(100));
+    }
+
+    /// The `Match` kill lifecycle (`pidfd_open` → start-time re-verification →
+    /// `comm_is_firecracker` → `pidfd_send_kill` → `wait_for_death` →
+    /// registry removal) had zero coverage — every other test used a
+    /// mismatched/absent start time or a non-firecracker comm so the
+    /// irreversible success path was never executed. This test spawns a
+    /// disposable process whose `/proc/<pid>/comm` is literally
+    /// `firecracker` (a copy of `sleep` renamed to `firecracker`, so the
+    /// binary runs but reports the expected comm), records its TRUE start
+    /// time, inserts a sandbox entry, and asserts `kill_orphans` actually
+    /// kills it via the pidfd path: `killed == 1`, `kill_failed == 0`, and
+    /// the registry entry is removed. Linux-only (pidfd_open + /proc).
+    ///
+    /// The child is **double-forked via a shell** so it is reparented to
+    /// init (PID 1), not held as a child of this test process. This mirrors
+    /// production: real Firecracker orphans are NOT children of the
+    /// controller, so when `kill_orphans` SIGKILLs them, init reaps them
+    /// and `/proc/<pid>` disappears quickly. A child of the test process
+    /// would instead linger as a zombie (held by the test until reaped),
+    /// causing `wait_for_death` to time out and report `kill_failed`.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn kill_orphans_match_arm_kills_verified_firecracker_via_pidfd() {
+        use std::process::{Command, Stdio};
+
+        let td = TempDir::new().unwrap();
+        let path = td.path().join("state.json");
+        let r = Registry::load_or_init(&path).unwrap();
+
+        // Create a disposable binary whose /proc/<pid>/comm is "firecracker".
+        // /proc/<pid>/comm is derived from the executable's basename
+        // (truncated to 15 chars), so a copy of `sleep` named `firecracker`
+        // reports comm == "firecracker" while running the real `sleep` binary.
+        let firecracker_bin = td.path().join("firecracker");
+        std::fs::copy(
+            std::env::var("FORKD_TEST_SLEEP_BIN")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|_| {
+                    // /bin/sleep and /usr/bin/sleep are the usual locations;
+                    // resolve via `which`-like lookup against common dirs.
+                    ["/bin/sleep", "/usr/bin/sleep"]
+                        .into_iter()
+                        .map(std::path::PathBuf::from)
+                        .find(|p| p.exists())
+                        .expect("sleep binary not found in /bin/sleep or /usr/bin/sleep")
+                }),
+            &firecracker_bin,
+        )
+        .expect("copy sleep → firecracker");
+
+        // Double-fork via `sh -c '... & echo $!'` so the firecracker-named
+        // process is reparented to init (PID 1), not held as a child of this
+        // test. The shell backgrounds the process, prints its PID, and exits;
+        // the backgrounded process is then reparented to init. This ensures
+        // `wait_for_death` sees `/proc/<pid>` disappear after SIGKILL
+        // (init reaps the reparented process immediately), rather than
+        // timing out on a zombie held by the test.
+        let sh_out = Command::new("sh")
+            .arg("-c")
+            .arg(format!("{} 30 & echo $!", firecracker_bin.display()))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+            .expect("spawn detached firecracker-named sleep via sh");
+        let pid: u32 = String::from_utf8_lossy(&sh_out.stdout)
+            .trim()
+            .parse()
+            .expect("parse detached firecracker child PID from sh output");
+
+        // Sanity: confirm /proc/<pid>/comm really is "firecracker".
+        let comm = std::fs::read_to_string(format!("/proc/{pid}/comm"))
+            .expect("read /proc/<pid>/comm");
+        assert_eq!(
+            comm.trim(),
+            "firecracker",
+            "test harness requires comm == firecracker, got {comm:?}"
+        );
+
+        // Record the child's REAL start time so process_identity_matches
+        // returns Match (the primary identity check passes).
+        let starttime = read_proc_starttime(pid).expect("read child starttime");
+
+        r.insert_sandbox(SandboxInfo {
+            id: "sb-firecracker-match".into(),
+            snapshot_tag: "py".into(),
+            netns: Some("forkd-child-1".into()),
+            guest_addr: "10.42.0.2:8888".into(),
+            created_at_unix: 1,
+            pid: Some(pid),
+            proc_starttime: Some(starttime),
+            memory_limit_mib: None,
+            has_branched: false,
+            last_branch_memory_path: None,
+            branch_count: 0,
+        })
+        .unwrap();
+
+        let result = r.kill_orphans().unwrap();
+        // The irreversible success path executed: the verified
+        // firecracker-named process was killed via pidfd_send_kill and
+        // waited for death, and the registry entry was removed.
+        assert_eq!(
+            result.killed, 1,
+            "verified firecracker-named child must be killed, got killed={} \
+             (kill_failed={}, pruned_stale={})",
+            result.killed, result.kill_failed, result.pruned_stale
+        );
+        assert_eq!(
+            result.kill_failed, 0,
+            "kill must succeed for a verified firecracker-named child"
+        );
+        assert_eq!(
+            result.pruned_stale, 0,
+            "a killed child is counted under `killed`, not `pruned_stale`"
+        );
+        assert_eq!(
+            r.list_sandboxes().len(),
+            0,
+            "registry entry must be removed after a successful kill"
+        );
+
+        // Defense-in-depth cleanup: if the test failed an assertion above
+        // before kill_orphans ran (or kill_orphans somehow did not reap the
+        // reparented process), ensure the detached process is not leaked.
+        // It was reparented to init so we don't own a Child handle; signal
+        // it directly by PID (no-op if already reaped by init).
+        let _ = unsafe { libc::kill(pid as i32, libc::SIGKILL) };
     }
 }
