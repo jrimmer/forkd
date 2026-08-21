@@ -2958,7 +2958,6 @@ fn spawn_one_for_workspace(
         enable_diff_snapshots: true,
         sync_guest_clocks: true,
         socket_wait_timeout_secs: daemon_socket_wait_timeout_secs(),
-
     };
     let work_dir =
         std::env::temp_dir().join(format!("forkd-workspace-{snapshot_tag}-o{netns_offset}"));
