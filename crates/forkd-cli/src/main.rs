@@ -1923,7 +1923,7 @@ fn rootfs_cache_meta_path(rootfs: &std::path::Path) -> std::path::PathBuf {
 /// sha256 of the finished file so subsequent cache hits can verify
 /// integrity without re-hashing on every spawn.
 fn write_rootfs_cache_meta(rootfs: &std::path::Path, image: &str, size_mib: u32) -> Result<()> {
-    let sha = sha256_file(rootfs)?;
+    let sha = hub::sha256_file(rootfs)?;
     let meta = RootfsCacheMeta {
         schema_version: ROOTFS_CACHE_SCHEMA_VERSION,
         sha256: sha,
@@ -1984,7 +1984,7 @@ fn validate_cached_rootfs(rootfs: &std::path::Path) -> Result<()> {
             ROOTFS_CACHE_SCHEMA_VERSION
         );
     }
-    let live_sha = sha256_file(rootfs)?;
+    let live_sha = hub::sha256_file(rootfs)?;
     if live_sha != meta.sha256 {
         bail!(
             "cache untrusted: rootfs {} sha256 mismatch (meta={}, live={}); \
