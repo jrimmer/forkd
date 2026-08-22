@@ -216,35 +216,34 @@ impl Registry {
         Ok(())
     }
 
-    /// Prune sandbox entries whose recorded pid is no longer alive.
-    /// Snapshots are kept regardless (they're disk artifacts).
+    /// Prune sandbox entries whose recorded pid is no longer alive, and
+    /// mark any `Running` workspace whose sandbox was just pruned as
+    /// `Stale` (#116): the daemon crashed/restarted out from under it.
+    /// Suspended workspaces are untouched; they were intentionally
+    /// parked. Snapshots are kept regardless (they're disk artifacts).
+    ///
+    /// Runs the whole in-memory pass under one registry lock (#310):
+    /// `pid_alive` is a `/proc` stat, cheap and free of any lock we
+    /// care about, so holding the mutex across it is fine and removes
+    /// the window where an HTTP handler could remove/reinsert a
+    /// just-observed-stale id between the scan and the prune.
     pub fn reconcile(&self) -> Result<usize> {
-        let mut pruned = 0usize;
-        let stale: Vec<String> = {
-            let g = self.inner.lock();
-            g.sandboxes
+        let (pruned, stale_ws_changed) = {
+            let mut g = self.inner.lock();
+            let stale_ids: Vec<String> = g
+                .sandboxes
                 .iter()
                 .filter_map(|(id, sb)| match sb.pid {
                     Some(pid) if !pid_alive(pid) => Some(id.clone()),
                     _ => None,
                 })
-                .collect()
-        };
-        for id in stale {
-            self.inner.lock().sandboxes.remove(&id);
-            pruned += 1;
-        }
+                .collect();
+            for id in &stale_ids {
+                g.sandboxes.remove(id);
+            }
 
-        // Workspaces (#116): any workspace marked Running whose
-        // live_sandbox_id is no longer in the live sandbox table is
-        // Stale — the daemon crashed/restarted out from under it.
-        // We don't touch Suspended workspaces; they were intentionally
-        // parked.
-        let live_ids: std::collections::HashSet<String> =
-            self.inner.lock().sandboxes.keys().cloned().collect();
-        let mut stale_ws_changed = false;
-        {
-            let mut g = self.inner.lock();
+            let live_ids: std::collections::HashSet<String> = g.sandboxes.keys().cloned().collect();
+            let mut stale_ws_changed = false;
             for ws in g.workspaces.values_mut() {
                 if ws.status == WorkspaceStatus::Running {
                     let live = ws
@@ -258,7 +257,9 @@ impl Registry {
                     }
                 }
             }
-        }
+
+            (stale_ids.len(), stale_ws_changed)
+        };
 
         if pruned > 0 || stale_ws_changed {
             self.flush()?;
@@ -305,6 +306,102 @@ mod tests {
             last_branch_memory_path: None,
             branch_count: 0,
         }
+    }
+
+    fn running_workspace(
+        name: impl Into<String>,
+        live_sandbox_id: impl Into<String>,
+    ) -> WorkspaceInfo {
+        WorkspaceInfo {
+            id: "ws-id-1".into(),
+            name: name.into(),
+            source_snapshot_tag: "py".into(),
+            current_state_tag: None,
+            status: WorkspaceStatus::Running,
+            live_sandbox_id: Some(live_sandbox_id.into()),
+            created_at_unix: 1,
+            last_active_unix: 1,
+            last_branch_memory_path: None,
+            per_child_netns: false,
+        }
+    }
+
+    #[test]
+    fn reconcile_prunes_dead_sandbox_and_marks_its_workspace_stale() {
+        let td = TempDir::new().unwrap();
+        let path = td.path().join("state.json");
+        let r = Registry::load_or_init(&path).unwrap();
+
+        // "sb-dead" carries an unreachable pid (see `sandbox()`), so
+        // reconcile must prune it; "ws-a" was Running on it, so it must
+        // flip to Stale with live_sandbox_id cleared. "sb-live" has no
+        // pid recorded at all (pid: None is never treated as dead), so
+        // "ws-b" must be untouched, and Suspended "ws-c" must stay
+        // Suspended even though its sandbox is also gone.
+        r.insert_sandbox(sandbox("sb-dead")).unwrap();
+        let mut sb_live = sandbox("sb-live");
+        sb_live.pid = None;
+        r.insert_sandbox(sb_live).unwrap();
+        r.insert_workspace(running_workspace("ws-a", "sb-dead"))
+            .unwrap();
+        r.insert_workspace(running_workspace("ws-b", "sb-live"))
+            .unwrap();
+        r.insert_workspace(WorkspaceInfo {
+            status: WorkspaceStatus::Suspended,
+            live_sandbox_id: None,
+            ..running_workspace("ws-c", "sb-gone-already")
+        })
+        .unwrap();
+
+        let pruned = r.reconcile().unwrap();
+
+        assert_eq!(pruned, 1, "only sb-dead has a recorded, unreachable pid");
+        assert!(r.get_sandbox("sb-dead").is_none());
+        assert!(r.get_sandbox("sb-live").is_some());
+
+        let ws_a = r.get_workspace("ws-a").unwrap();
+        assert_eq!(ws_a.status, WorkspaceStatus::Stale);
+        assert_eq!(ws_a.live_sandbox_id, None);
+
+        let ws_b = r.get_workspace("ws-b").unwrap();
+        assert_eq!(ws_b.status, WorkspaceStatus::Running);
+        assert_eq!(ws_b.live_sandbox_id.as_deref(), Some("sb-live"));
+
+        let ws_c = r.get_workspace("ws-c").unwrap();
+        assert_eq!(ws_c.status, WorkspaceStatus::Suspended);
+
+        // Reloading from disk proves flush() actually ran (pruned > 0).
+        let reloaded = Registry::load_or_init(&path).unwrap();
+        assert_eq!(reloaded.list_sandboxes().len(), 1);
+        assert_eq!(
+            reloaded.get_workspace("ws-a").unwrap().status,
+            WorkspaceStatus::Stale
+        );
+    }
+
+    #[test]
+    fn reconcile_no_op_does_not_flush() {
+        let td = TempDir::new().unwrap();
+        let path = td.path().join("state.json");
+        let r = Registry::load_or_init(&path).unwrap();
+        let mut sb_live = sandbox("sb-live");
+        sb_live.pid = None;
+        r.insert_sandbox(sb_live).unwrap();
+
+        assert!(
+            path.exists(),
+            "insert_sandbox should have flushed once already"
+        );
+        let before = fs::read_to_string(&path).unwrap();
+
+        let pruned = r.reconcile().unwrap();
+
+        assert_eq!(pruned, 0);
+        let after = fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            before, after,
+            "a no-op reconcile must not rewrite state.json"
+        );
     }
 
     #[test]
