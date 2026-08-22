@@ -1183,6 +1183,7 @@ const CLOCK_SYNC_EXEC_TIMEOUT: Duration = Duration::from_secs(5);
 /// - **Adds latency to restore**: ~1-5 seconds per batch (agent polling
 ///   + exec), running in parallel across children. Measured at
 ///     ~1-2 seconds for typical Debian/Ubuntu-based images.
+///
 /// Map a `Vec<Option<T>>` of per-slot children (failed slots are `None`)
 /// into a slice of `(original_1_based_slot, &T)` for the live children,
 /// where `original_1_based_slot` is the index the child occupied in the
