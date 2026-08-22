@@ -2278,10 +2278,19 @@ fn run_cmd(
                 memory_backend: forkd_vmm::MemoryBackend::File,
                 enable_diff_snapshots: false,
                 sync_guest_clocks: false,
+                socket_wait_timeout_secs: forkd_vmm::DEFAULT_SOCKET_WAIT_SECS,
             },
             &work_dir,
         )
         .context("restore_many failed")?;
+    if result.children.is_empty() {
+        let detail = result
+            .failures
+            .first()
+            .map(|f| format!("child {} {:?}: {}", f.child_index, f.phase, f.error))
+            .unwrap_or_else(|| "no children restored".to_string());
+        bail!("restore_many produced no live child: {detail}");
+    }
 
     // Wait for the agent to come up, then exec the command.
     let target = "10.42.0.2:8888".to_string();
@@ -2307,8 +2316,8 @@ fn run_cmd(
     let exit = resp.exit_code;
 
     // Shutdown.
-    for c in &result.children {
-        let _ = c.shutdown();
+    for fc in &result.children {
+        let _ = fc.vm.shutdown();
     }
     drop(result);
 
@@ -3130,15 +3139,25 @@ fn fork_cmd(
                 // CLI fork doesn't outlive its invocation, no diff snapshots.
                 enable_diff_snapshots: false,
                 sync_guest_clocks: false,
+                socket_wait_timeout_secs: forkd_vmm::DEFAULT_SOCKET_WAIT_SECS,
             },
             &work_dir,
         )
         .context("restore_many_with failed")?;
+    if !result.failures.is_empty() {
+        for f in &result.failures {
+            eprintln!(
+                "⚠ child {} {:?} failed: {}",
+                f.child_index, f.phase, f.error
+            );
+        }
+    }
 
     let total_ms = result.spawn_ms + result.restore_ms;
     println!("✓ all sockets up in {} ms", result.spawn_ms);
     println!(
-        "✓ {n} restores fired in parallel in {} ms",
+        "✓ {} / {n} restores fired in parallel in {} ms",
+        result.children.len(),
         result.restore_ms
     );
     println!("✓ total wall-clock: {total_ms} ms");
@@ -3146,12 +3165,12 @@ fn fork_cmd(
     eprintln!("==> letting children settle for {settle_secs}s...");
     thread::sleep(Duration::from_secs(settle_secs));
 
-    let alive = result.children.iter().filter(|c| c.is_alive()).count();
+    let alive = result.children.iter().filter(|fc| fc.vm.is_alive()).count();
     println!("✓ {alive} / {n} children alive");
 
     eprintln!("==> shutting down...");
-    for c in &result.children {
-        let _ = c.shutdown();
+    for fc in &result.children {
+        let _ = fc.vm.shutdown();
     }
     thread::sleep(Duration::from_secs(2));
     drop(result); // triggers kill via Drop for any still alive
