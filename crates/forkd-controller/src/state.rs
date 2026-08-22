@@ -1881,34 +1881,47 @@ mod tests {
         )
         .expect("copy sleep → firecracker");
 
-        // Double-fork via `sh -c '... & echo $!'` so the firecracker-named
-        // process is reparented to init (PID 1), not held as a child of this
-        // test. The shell backgrounds the process, prints its PID, and exits;
-        // the backgrounded process is then reparented to init. This ensures
-        // `wait_for_death` sees `/proc/<pid>` disappear after SIGKILL
-        // (init reaps the reparented process immediately), rather than
-        // timing out on a zombie held by the test.
-        let sh_out = Command::new("sh")
-            .arg("-c")
-            .arg(format!("{} 30 & echo $!", firecracker_bin.display()))
+        // Spawn the firecracker-named process as a DIRECT child held by this
+        // test, NOT a detached/orphaned process. A detached, shell-backgrounded
+        // child reparented to init is reaped too early by the CI runner (it
+        // exits and becomes a zombie before kill_orphans runs), which makes
+        // process_identity_matches return Dead and the test flaky. Owning the
+        // Child keeps it alive until we choose to act.
+        //
+        // A private reaper thread wait()s the child so that when kill_orphans
+        // SIGKILLs it, the killed child is reaped immediately (clearing
+        // /proc/<pid>) rather than lingering as a zombie held by this test.
+        // wait_for_death (inside kill_orphans) polls /proc/<pid> and therefore
+        // observes the reaping.
+        let child = Command::new(&firecracker_bin)
+            .arg("30") // plenty long; we SIGKILL it well before it would exit
             .stdin(Stdio::null())
-            .stdout(Stdio::piped())
+            .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .output()
-            .expect("spawn detached firecracker-named sleep via sh");
-        let pid: u32 = String::from_utf8_lossy(&sh_out.stdout)
-            .trim()
-            .parse()
-            .expect("parse detached firecracker child PID from sh output");
+            .spawn()
+            .expect("spawn firecracker-named sleep as direct child");
+        let pid = child.id();
+        // Own the Child entirely in a reaper thread: it blocks on wait() so
+        // that when kill_orphans SIGKILLs the process, the killed child is
+        // reaped immediately (clearing /proc/<pid>) rather than lingering as
+        // a zombie. wait_for_death (inside kill_orphans) polls /proc/<pid> and
+        // therefore observes the reaping.
+        let reaper = std::thread::spawn(move || {
+            let mut child = child;
+            let _ = child.wait(); // reap promptly once the test SIGKILLs it
+        });
 
         // Sanity: confirm /proc/<pid>/comm really is "firecracker".
-        let comm =
-            std::fs::read_to_string(format!("/proc/{pid}/comm")).expect("read /proc/<pid>/comm");
-        assert_eq!(
-            comm.trim(),
-            "firecracker",
-            "test harness requires comm == firecracker, got {comm:?}"
-        );
+        let _comm = {
+            let read = std::fs::read_to_string(format!("/proc/{pid}/comm"))
+                .expect("read /proc/<pid>/comm");
+            assert_eq!(
+                read.trim(),
+                "firecracker",
+                "test harness requires comm == firecracker, got {read:?}"
+            );
+            read
+        };
 
         // Record the child's REAL start time so process_identity_matches
         // returns Match (the primary identity check passes).
@@ -1954,11 +1967,11 @@ mod tests {
             "registry entry must be removed after a successful kill"
         );
 
-        // Defense-in-depth cleanup: if the test failed an assertion above
-        // before kill_orphans ran (or kill_orphans somehow did not reap the
-        // reparented process), ensure the detached process is not leaked.
-        // It was reparented to init so we don't own a Child handle; signal
-        // it directly by PID (no-op if already reaped by init).
+        // Defense-in-depth cleanup: ensure the direct child is reaped (it was
+        // SIGKILLed by kill_orphans above; the reaper thread eats the zombie or
+        // the child if kill_orphans somehow left it alive). The reaper's
+        // wait() returns once the process is gone; join it to ensure cleanup.
         let _ = unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        let _ = reaper.join();
     }
 }
