@@ -1471,7 +1471,7 @@ async fn create_sandbox(
                     tracing::warn!(
                         attempt = attempt + 1,
                         next_backoff_ms = backoffs_ms[attempt],
-                        error = %e,
+                        error = %msg,
                         "restore_many: tap/cgroup busy, retrying"
                     );
                 }
