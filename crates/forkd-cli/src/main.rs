@@ -780,6 +780,29 @@ fn validate_tag(tag: &str) -> Result<()> {
     Ok(())
 }
 
+/// Review #295 blocker 3 / 2026-08-22: does `snap_dir`'s own
+/// `rootfs.ext4` (the path the RW clone will land at) resolve to the SAME
+/// file as the source baseline `src`? If so, cloning would write over the
+/// very file we're reading from — a corrupt self-clone.
+///
+/// The comparison is against the FINAL published path (`snap_dir/rootfs.ext4`),
+/// NOT a transient staging path. Comparing against staging would let the
+/// existing tag's own `snap_dir/rootfs.ext4` slip past the guard, then
+/// publication would delete the original baseline and leave a dirty clone in
+/// its place. Canonical compare resolves symlinks / `.` / `..` / relative-vs-abs.
+fn rootfs_clone_into_self(src: &std::path::Path, snap_dir: &std::path::Path) -> bool {
+    let src_canon = src.canonicalize().unwrap_or_else(|_| src.to_path_buf());
+    let final_path = snap_dir.join("rootfs.ext4");
+    // snap_dir may not exist yet, so canonicalize the parent + filename
+    // instead of the full path.
+    let final_canon = final_path
+        .parent()
+        .map(|p| p.canonicalize().unwrap_or_else(|_| p.to_path_buf()))
+        .map(|p| p.join("rootfs.ext4"))
+        .unwrap_or(final_path);
+    src_canon == final_canon
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     let cli = Cli::parse();
@@ -1261,22 +1284,44 @@ enum SidecarSource<'a> {
 /// unpacked into. `rootfs.target_path` is a PORTABLE, host-independent
 /// path relative to `snap_dir` (review #295 r6 blocker 3 — e.g.
 /// `"rootfs.ext4"`); it is resolved against `snap_dir` to get the
-/// absolute path Firecracker reopens. If `target_path` is absolute
-/// (legacy packs written before portability), it is used as-is.
+/// absolute path Firecracker reopens. A target_path that is absolute
+/// or contains `..` is REJECTED (fail-closed) — see the safety
+/// validation in the body (review #295 blocker 4 / 2026-08-22).
 fn satisfy_rootfs(
     rootfs: &hub::RootfsRef,
     source: SidecarSource,
     snap_dir: &std::path::Path,
 ) -> Result<()> {
-    // Resolve the portable (relative) target_path against the
-    // destination snapshot dir. Absolute paths (legacy packs) are
-    // used as-is so old packs still restore.
+    // Review #295 blocker 4 / 2026-08-22: validate `target_path` BEFORE
+    // resolving it against snap_dir. A malicious/buggy manifest can
+    // supply `../../...` (or an absolute path) and sidecar placement
+    // would otherwise write outside the snapshot directory — dangerous
+    // because these commands are commonly run via sudo.
+    //
+    // Current forkd packs emit a PORTABLE, single-component relative
+    // filename (e.g. "rootfs.ext4" — see emit_rootfs_sidecar). We
+    // therefore require target_path to be a safe, bare filename:
+    //   - not absolute,
+    //   - exactly one path component (no `/`, no `\`, no leading `./`),
+    //   - no `.` or `..` components,
+    //   - non-empty.
+    // A legacy absolute path is refused (fail-closed) rather than honored
+    // with an unconditional write outside the snapshot dir, per the
+    // explicit-safe-migration requirement.
     let target = std::path::Path::new(&rootfs.target_path);
-    let dst = if target.is_absolute() {
-        target.to_path_buf()
-    } else {
-        snap_dir.join(target)
-    };
+    let is_safe_filename = !target.is_absolute()
+        && target.components().count() == 1
+        && target.file_name().map(|n| !n.is_empty()).unwrap_or(false);
+    if !is_safe_filename {
+        return Err(anyhow::anyhow!(
+            "unsafe rootfs target_path {:?} in manifest (must be a single safe relative \
+             filename like \"rootfs.ext4\", no path separators / absolute / \"..\"). \
+             Re-pack with a current forkd; legacy absolute target_paths are not honored \
+             because they allow writing outside the snapshot directory.",
+            rootfs.target_path
+        ));
+    }
+    let dst = snap_dir.join(target);
     if dst.exists() {
         if let Ok(existing) = hub::sha256_file(&dst) {
             if existing.eq_ignore_ascii_case(&rootfs.sha256) {
@@ -2709,20 +2754,15 @@ fn snapshot_cmd(
             .with_context(|| format!("remove stale staging dir {}", staging_dir.display()))?;
     }
 
-    // src == dst guard: cloning the baseline into itself would both
-    // produce a corrupt "clone" and, after publish, let a re-run
-    // unlink its own source. Compare canonical paths (resolves
-    // symlinks, `..`, relative-vs-absolute).
-    let rootfs_canon = rootfs.canonicalize().unwrap_or_else(|_| rootfs.clone());
-    let staging_rootfs_canon = staging_dir.join("rootfs.ext4");
-    // (staging_dir doesn't exist yet, so canonicalize the parent +
-    // filename instead of the full path.)
-    let staging_rootfs_canon = staging_dir
-        .parent()
-        .map(|p| p.canonicalize().unwrap_or_else(|_| p.to_path_buf()))
-        .map(|p| p.join("rootfs.ext4"))
-        .unwrap_or(staging_rootfs_canon);
-    if rw && rootfs_canon == staging_rootfs_canon {
+    // src == dst guard (review #295 blocker 3 / 2026-08-22): cloning the
+    // src == dst guard (review #295 blocker 3 / 2026-08-22): reject
+    // cloning the baseline into the snapshot's own final rootfs path. See
+    // `rootfs_clone_into_self` — canonical compare against the FINAL
+    // published path, not a transient staging path.
+    if rw && rootfs_clone_into_self(&rootfs, &snap_dir) {
+        let rootfs_canon = rootfs
+            .canonicalize()
+            .unwrap_or_else(|_| rootfs.to_path_buf());
         bail!(
             "refusing to clone rootfs into itself: source {} resolves to {}, \
              which is the snapshot's own rootfs.ext4 path. Use a different \
@@ -2733,9 +2773,32 @@ fn snapshot_cmd(
     }
 
     let boot_rootfs = if rw {
-        std::fs::create_dir_all(&staging_dir)
-            .with_context(|| format!("create staging dir {}", staging_dir.display()))?;
-        let clone_path = staging_dir.join("rootfs.ext4");
+        // Blocker 1 (review r8/2026-08-22): the FC-visible rootfs drive
+        // path is serialized into the binary vmstate at snapshot time and
+        // is REOPENED by that exact path on restore (Firecracker does not
+        // accept a PUT /drives override before /snapshot/load). If we
+        // booted from a transient `staging_dir/rootfs.ext4` and then
+        // renamed the whole directory, the recorded path would vanish and
+        // the first restore after publish would fail. Therefore the RW
+        // clone must live at its FINAL, stable path (`snap_dir/rootfs.ext4`)
+        // from the moment the VM boots. Only the volatile artifacts
+        // (vmstate, memory.bin, snapshot.json) are staged and swapped
+        // atomically at publish.
+        std::fs::create_dir_all(&snap_dir)
+            .with_context(|| format!("create snapshot dir {}", snap_dir.display()))?;
+        let clone_path = snap_dir.join("rootfs.ext4");
+        // `reflink_copy` opens the destination with `create_new(true)`
+        // (EEXIST on an existing file). On a re-snapshot/re-bake of an
+        // existing tag, snap_dir/rootfs.ext4 already exists from the prior
+        // bake. The self-clone guard above already ruled out
+        // `src == snap_dir/rootfs.ext4`, so removing a stale clone here is
+        // safe (we are replacing this tag's rootfs with a fresh clone of a
+        // DISTINCT baseline).
+        if clone_path.exists() {
+            std::fs::remove_file(&clone_path).with_context(|| {
+                format!("remove stale clone {} before re-bake", clone_path.display())
+            })?;
+        }
         eprintln!("    rootfs mode: read-write (ext4, immutable baseline clone)");
         eprintln!(
             "    cloning rootfs {} → {} (reflink preferred)...",
@@ -2824,11 +2887,13 @@ fn snapshot_cmd(
         .snapshot_to(vmstate, memory, volumes)
         .context("snapshot create")?;
     // Record the rootfs path Firecracker froze into the vmstate so
-    // `pack` / `pull` can ship + relocate it (issue #242). For the RW
-    // clone this was the STAGING rootfs.ext4 path; after publish the
-    // clone lives at snap_dir/rootfs.ext4, so re-point the recorded
-    // path at the final location (canonicalized) — pull placement
-    // must not depend on the transient staging path.
+    // `pack` / `pull` can ship + relocate it (issue #242). With the
+    // blocker-1 fix the RW clone boots directly from the STABLE final
+    // path `snap_dir/rootfs.ext4` (see boot_rootfs above) — so the
+    // vmstate already records the path that persists after publish, and
+    // `Snap.rootfs` points at the same canonical final location. Nothing
+    // transient is recorded. (Previously the VM booted from a
+    // `staging_dir/rootfs.ext4` that vanished on publish.)
     if rw {
         snap.rootfs = Some(
             snap_dir
@@ -2852,24 +2917,30 @@ fn snapshot_cmd(
     std::fs::write(staging_dir.join("snapshot.json"), meta).context("write snapshot.json")?;
 
     // Kill the parent BEFORE publishing so the rootfs clone is no
-    // longer being held open by a live Firecracker when we rename it.
+    // longer being held open by a live Firecracker when we move the
+    // metadata files into place.
     vm.kill().context("kill parent")?;
 
-    // Atomically publish: replace the published snap_dir with the
-    // staging dir. On Linux, rename over an existing directory is NOT
-    // atomic, so we do the two-step shuffle: move the old snap_dir
-    // aside, rename staging into place, then drop the old one. If the
-    // rename-into-place succeeds we're committed; if it fails we restore
-    // the old snap_dir from the aside copy. The aside dir is cleaned up
-    // last, so a crash at any point leaves either the new or the old
-    // snapshot intact, never neither.
-    publish_snapshot(&staging_dir, &snap_dir).with_context(|| {
+    // Publish the snapshot metadata. The RW rootfs already lives at the
+    // stable final path `snap_dir/rootfs.ext4` (blocker-1 fix) so it is
+    // NOT moved here — only vmstate, memory.bin, and snapshot.json are
+    // staged and then renamed into snap_dir.
+    //
+    // snapshot.json is the restore entry point (`load_snapshot_meta`):
+    // we install vmstate + memory.bin first and snapshot.json LAST, so a
+    // crash mid-publish leaves either the old snapshot.json (pointing at
+    // the old vmstate/memory, still present because we rename over) or
+    // the new one. `fs::rename` over an existing path is atomic on Linux.
+    publish_snapshot_metadata(&staging_dir, &snap_dir).with_context(|| {
         format!(
-            "publish staging {} → snap_dir {}",
+            "publish snapshot metadata staging {} → snap_dir {}",
             staging_dir.display(),
             snap_dir.display()
         )
     })?;
+    // Drop the staged-only dir (now empty of the files we renamed, or
+    // holding only a leftover on a partial failure).
+    let _ = std::fs::remove_dir_all(&staging_dir);
     eprintln!("    published snapshot → {}", snap_dir.display());
 
     // Parent VM is dead and the snapshot lives under data_dir; work_dir
@@ -2932,74 +3003,53 @@ fn cleanup_workdir(work_dir: &std::path::Path) {
 /// `.old-<pid>` dir that a later run can clean up (it is never mistaken
 /// for a snapshot because `list_local` only enumerates valid snapshot
 /// dirs, and the `.old-` prefix keeps it out of tag-based lookups).
-fn publish_snapshot(staging: &std::path::Path, snap_dir: &std::path::Path) -> Result<()> {
-    let parent = snap_dir
-        .parent()
-        .with_context(|| format!("snap_dir {} has no parent", snap_dir.display()))?;
-    // Ensure the parent exists so the aside + rename have a home.
-    std::fs::create_dir_all(parent)
-        .with_context(|| format!("create snapshot parent {}", parent.display()))?;
+/// Publish a snapshot's VOLATILE metadata (vmstate, memory.bin,
+/// snapshot.json) from a temporary `staging` dir into the target
+/// `snap_dir`, leaving the rootfs file (which lives at the stable
+/// `snap_dir/rootfs.ext4` from boot time — blocker-1 fix) untouched.
+///
+/// Unlike the previous whole-directory rename, this must NOT move the
+/// rootfs: Firecracker serializes the drive `path_on_host` into the
+/// binary vmstate and reopens it on restore, so the rootfs clone must
+/// stay at the path the snapshot recorded.
+///
+/// Ordering: rename `vmstate` and `memory.bin` first, then
+/// `snapshot.json` LAST. `snapshot.json` is the restore entry point
+/// (`load_snapshot_meta`); a crash mid-publish therefore leaves either
+/// the OLD snapshot.json (restore still points at the old vmstate/memory,
+/// both still present because `fs::rename` atomically replaces files) or
+/// the NEW one — never a snapshot.json pointing at a half-installed set.
+/// `fs::rename` over an existing path is atomic on Linux.
+fn publish_snapshot_metadata(staging: &std::path::Path, snap_dir: &std::path::Path) -> Result<()> {
+    // Ensure the target snapshot dir exists so the metadata files have a
+    // home. The rootfs.ext4 may already be there (RW clone) or absent (RO
+    // squashfs, never staged/cloned into it). create_dir_all is a no-op
+    // when it already exists.
+    std::fs::create_dir_all(snap_dir)
+        .with_context(|| format!("create snapshot dir {}", snap_dir.display()))?;
 
-    let aside = parent.join(format!(
-        "{}.old-{}",
-        snap_dir
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("snapshot"),
-        std::process::id()
-    ));
-    // A stale aside from a previous crashed publish should not exist
-    // (the pid is unique per run), but if it does, drop it — it was
-    // never the committed snapshot.
-    if aside.exists() {
-        let _ = std::fs::remove_dir_all(&aside);
+    // Each metadata file is atomic-moved into place; snapshot.json last
+    // is the commit marker. Verify EVERY staged file exists BEFORE the
+    // first rename so a torn staging dir (missing memory.bin, etc.) is
+    // rejected without installing a half-written vmstate/memory pair
+    // (review-correctness follow-up: pre-check all, then atomically move).
+    const META: [&str; 3] = ["vmstate", "memory.bin", "snapshot.json"];
+    for name in META {
+        let staged = staging.join(name);
+        if !staged.exists() {
+            return Err(anyhow::anyhow!(
+                "publish: staged file {} missing; cannot publish incomplete snapshot",
+                staged.display()
+            ));
+        }
     }
-
-    let had_old = snap_dir.exists();
-    if had_old {
-        std::fs::rename(snap_dir, &aside).with_context(|| {
-            format!(
-                "move old snap_dir {} aside → {}",
-                snap_dir.display(),
-                aside.display()
-            )
+    // All present — now move them in snapshot.json-last order.
+    for name in META {
+        let staged = staging.join(name);
+        let dest = snap_dir.join(name);
+        std::fs::rename(&staged, &dest).with_context(|| {
+            format!("publish metadata {} → {}", staged.display(), dest.display())
         })?;
-    }
-
-    // Commit point: rename staging → snap_dir.
-    if let Err(e) = std::fs::rename(staging, snap_dir) {
-        // Restore the old snapshot from the aside so the tag isn't left
-        // with nothing. If the restore also fails, surface both errors.
-        if had_old {
-            if let Err(restore_err) = std::fs::rename(&aside, snap_dir) {
-                return Err(anyhow::anyhow!(
-                    "publish failed ({e}) AND restoring the old snapshot \
-                     from {} failed ({restore_err}); the old snapshot is \
-                     still at {}",
-                    aside.display(),
-                    aside.display()
-                ));
-            }
-        }
-        return Err(e).with_context(|| {
-            format!(
-                "rename staging {} → snap_dir {}",
-                staging.display(),
-                snap_dir.display()
-            )
-        });
-    }
-
-    // Committed. Drop the old snapshot (best-effort).
-    if had_old {
-        if let Err(e) = std::fs::remove_dir_all(&aside) {
-            eprintln!(
-                "    note: published {} but could not remove old snapshot {}: {e}\n          \
-                 it is harmless and can be removed manually",
-                snap_dir.display(),
-                aside.display()
-            );
-        }
     }
     Ok(())
 }
@@ -4035,89 +4085,121 @@ mod tests {
         );
     }
 
-    /// Review #295 r6 blocker 2 + src==dst: `publish_snapshot` atomically
-    /// publishes a staging dir into the target snap_dir, replacing an
-    /// existing snapshot. The OLD snapshot must be dropped only after
-    /// the new one is committed, so a crash at any point leaves either
-    /// the new OR the old — never neither.
+    /// Review #295 blocker 1 / 2026-08-22: `publish_snapshot_metadata`
+    /// installs only the VOLATILE metadata (vmstate, memory.bin,
+    /// snapshot.json) into snap_dir, leaving the rootfs file at its
+    /// stable final path untouched. The rootfs must NOT be moved because
+    /// Firecracker serializes its drive path into the vmstate and reopens
+    /// it on restore. A re-snapshot replaces metadata while the existing
+    /// rootfs stays put until the new clone is written at the same path.
     #[test]
-    fn publish_snapshot_atomically_replaces_existing() {
+    fn publish_snapshot_metadata_replaces_metadata_keeps_rootfs() {
         let dir = tempfile::tempdir().unwrap();
         let snap_dir = dir.path().join("py");
-        // Existing (old) snapshot.
+        // Existing (old) snapshot, incl. a stable rootfs at the final path.
         std::fs::create_dir_all(&snap_dir).unwrap();
         std::fs::write(snap_dir.join("snapshot.json"), b"OLD").unwrap();
-        std::fs::write(snap_dir.join("rootfs.ext4"), b"OLD-ROOTFS").unwrap();
-        // Staging (new) snapshot.
+        std::fs::write(snap_dir.join("vmstate"), b"OLD-VMSTATE").unwrap();
+        std::fs::write(snap_dir.join("memory.bin"), b"OLD-MEM").unwrap();
+        std::fs::write(snap_dir.join("rootfs.ext4"), b"STABLE-ROOTFS").unwrap();
+        // Staging (new) metadata — note: NO rootfs.ext4 staged.
         let staging = dir.path().join("py.staging-123");
         std::fs::create_dir_all(&staging).unwrap();
         std::fs::write(staging.join("snapshot.json"), b"NEW").unwrap();
-        std::fs::write(staging.join("rootfs.ext4"), b"NEW-ROOTFS").unwrap();
+        std::fs::write(staging.join("vmstate"), b"NEW-VMSTATE").unwrap();
+        std::fs::write(staging.join("memory.bin"), b"NEW-MEM").unwrap();
 
-        publish_snapshot(&staging, &snap_dir).expect("publish should succeed");
+        publish_snapshot_metadata(&staging, &snap_dir).expect("publish should succeed");
 
-        // New snapshot is committed at snap_dir.
+        // Metadata replaced.
         assert_eq!(
             std::fs::read(snap_dir.join("snapshot.json")).unwrap(),
             b"NEW"
         );
         assert_eq!(
-            std::fs::read(snap_dir.join("rootfs.ext4")).unwrap(),
-            b"NEW-ROOTFS"
+            std::fs::read(snap_dir.join("vmstate")).unwrap(),
+            b"NEW-VMSTATE"
         );
-        // Staging dir is gone (renamed away).
-        assert!(
-            !staging.exists(),
-            "staging dir should be gone after publish"
-        );
-        // No stray aside dir left behind.
         assert_eq!(
-            std::fs::read_dir(dir.path()).unwrap().count(),
-            1,
-            "only snap_dir should remain; no stray .old- dir"
+            std::fs::read(snap_dir.join("memory.bin")).unwrap(),
+            b"NEW-MEM"
+        );
+        // Rootfs untouched (it stays at the stable final path).
+        assert_eq!(
+            std::fs::read(snap_dir.join("rootfs.ext4")).unwrap(),
+            b"STABLE-ROOTFS",
+            "rootfs must NOT be moved/overwritten by metadata publish"
+        );
+        // The staged metadata files were moved OUT of staging (the
+        // staging dir itself is removed later by snapshot_cmd).
+        assert!(
+            !staging.join("snapshot.json").exists(),
+            "snapshot.json should be moved out of staging after publish"
+        );
+        assert!(
+            !staging.join("vmstate").exists(),
+            "vmstate should be moved out of staging after publish"
+        );
+        assert!(
+            !staging.join("memory.bin").exists(),
+            "memory.bin should be moved out of staging after publish"
         );
     }
 
-    /// Review #295 r6 blocker 2: `publish_snapshot` into a NON-existent
-    /// snap_dir (first snapshot for this tag) works without the
-    /// aside-shuffle — just a rename into place.
+    /// Review #295 blocker 1 / 2026-08-22: `publish_snapshot_metadata`
+    /// into a NON-existent snap_dir (first snapshot for this tag)
+    /// creates the dir and installs the metadata.
     #[test]
-    fn publish_snapshot_into_nonexistent_snap_dir() {
+    fn publish_snapshot_metadata_into_nonexistent_snap_dir() {
         let dir = tempfile::tempdir().unwrap();
         let snap_dir = dir.path().join("fresh-tag");
         let staging = dir.path().join("fresh-tag.staging-1");
         std::fs::create_dir_all(&staging).unwrap();
         std::fs::write(staging.join("snapshot.json"), b"NEW").unwrap();
+        std::fs::write(staging.join("vmstate"), b"NEW-VMSTATE").unwrap();
+        std::fs::write(staging.join("memory.bin"), b"NEW-MEM").unwrap();
 
-        publish_snapshot(&staging, &snap_dir).expect("publish to fresh dir should succeed");
+        publish_snapshot_metadata(&staging, &snap_dir)
+            .expect("publish to fresh dir should succeed");
 
         assert!(snap_dir.exists());
         assert_eq!(
             std::fs::read(snap_dir.join("snapshot.json")).unwrap(),
             b"NEW"
         );
-        assert!(!staging.exists());
+        assert_eq!(
+            std::fs::read(snap_dir.join("vmstate")).unwrap(),
+            b"NEW-VMSTATE"
+        );
     }
 
-    /// Review #295 r6 blocker 2 (same-tag failure recovery): if
-    /// `publish_snapshot` is given a staging dir that doesn't exist (a
-    /// failed build), it errors WITHOUT touching the existing snapshot —
-    /// the last usable snapshot survives the failed re-run. This is the
-    /// same-tag failure regression: re-running a tag can no longer
-    /// destroy the last usable snapshot.
+    /// Review #295 blocker 1 + same-tag failure recovery: if staging is
+    /// missing a required metadata file (a failed/incomplete build), the
+    /// publish errors WITHOUT touching the existing snapshot — the last
+    /// usable snapshot survives the failed re-run.
     #[test]
-    fn publish_snapshot_preserves_existing_when_staging_missing() {
+    fn publish_snapshot_metadata_preserves_existing_when_metadata_missing() {
         let dir = tempfile::tempdir().unwrap();
         let snap_dir = dir.path().join("py");
         std::fs::create_dir_all(&snap_dir).unwrap();
         std::fs::write(snap_dir.join("snapshot.json"), b"OLD").unwrap();
+        std::fs::write(snap_dir.join("vmstate"), b"OLD-VMSTATE").unwrap();
+        std::fs::write(snap_dir.join("memory.bin"), b"OLD-MEM").unwrap();
         std::fs::write(snap_dir.join("rootfs.ext4"), b"OLD-ROOTFS").unwrap();
-        // Staging dir does NOT exist (build failed before staging).
+        // Staging exists but is missing memory.bin (incomplete build).
+        // vmstate + snapshot.json are present so the pre-check must reject
+        // BEFORE any rename — a torn vmstate/memory pair must never be
+        // installed.
         let staging = dir.path().join("py.staging-999");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(staging.join("snapshot.json"), b"NEW").unwrap();
+        std::fs::write(staging.join("vmstate"), b"NEW-VMSTATE").unwrap();
 
-        let err = publish_snapshot(&staging, &snap_dir).unwrap_err();
+        let err = publish_snapshot_metadata(&staging, &snap_dir).unwrap_err();
         let msg = format!("{err:#}");
-        // The existing snapshot MUST be intact.
+        // The existing snapshot MUST be fully intact — including vmstate
+        // and memory.bin — because the pre-check rejected before any
+        // rename (no torn pair).
         assert_eq!(
             std::fs::read(snap_dir.join("snapshot.json")).unwrap(),
             b"OLD"
@@ -4126,9 +4208,222 @@ mod tests {
             std::fs::read(snap_dir.join("rootfs.ext4")).unwrap(),
             b"OLD-ROOTFS"
         );
-        assert!(
-            msg.contains("staging") || msg.contains("rename"),
-            "should error on missing staging, got: {msg}"
+        assert_eq!(
+            std::fs::read(snap_dir.join("vmstate")).unwrap(),
+            b"OLD-VMSTATE",
+            "missing metadata must not install a torn vmstate"
         );
+        assert_eq!(
+            std::fs::read(snap_dir.join("memory.bin")).unwrap(),
+            b"OLD-MEM",
+            "missing metadata must not install a torn memory.bin"
+        );
+        assert!(
+            msg.contains("missing") || msg.contains("memory.bin"),
+            "should error on missing staged metadata, got: {msg}"
+        );
+    }
+
+    /// Review #295 blocker 4 / 2026-08-22: `satisfy_rootfs` must reject a
+    /// malicious `RootfsRef.target_path` that would escape the snapshot
+    /// dir (path traversal / absolute legacy path) BEFORE placing the
+    /// sidecar — otherwise the write lands outside `snap_dir`, which is
+    /// dangerous under sudo. Each unsafe shape must error and write
+    /// nothing.
+    #[test]
+    fn satisfy_rootfs_rejects_unsafe_target_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let snap_dir = tmp.path().join("snap");
+        std::fs::create_dir_all(&snap_dir).unwrap();
+
+        let unsafe_paths = [
+            "../../etc/passwd",     // traversal
+            "../../rootfs.ext4",    // escape one level
+            "/etc/cron.d/evil",     // absolute legacy path
+            "foo/../bar",           // embedded ..
+            "foo\\bar/rootfs.ext4", // separator via backslash
+            "",                     // empty
+            ".",                    // dot
+            "..",                   // parent
+        ];
+        for bad in unsafe_paths {
+            let rootfs_ref = hub::RootfsRef {
+                target_path: bad.to_string(),
+                sha256: "deadbeef".to_string(),
+                size: 0,
+            };
+            let res = satisfy_rootfs(
+                &rootfs_ref,
+                SidecarSource::LocalSibling(&tmp.path().join("pack.tar.zst")),
+                &snap_dir,
+            );
+            assert!(res.is_err(), "unsafe target_path {bad:?} must be rejected");
+            // Nothing written outside the snapshot dir.
+            assert!(
+                !tmp.path().join("etc/passwd").exists(),
+                "traversal must not write to {bad:?}"
+            );
+        }
+
+        // The safe portable filename still works: it resolves inside snap_dir.
+        std::fs::write(snap_dir.join("rootfs.ext4"), b"rootfs-content").unwrap();
+        let good_sha = hub::sha256_file(&snap_dir.join("rootfs.ext4")).unwrap();
+        let good = hub::RootfsRef {
+            target_path: "rootfs.ext4".to_string(),
+            sha256: good_sha,
+            size: 0,
+        };
+        let good_res = satisfy_rootfs(
+            &good,
+            SidecarSource::LocalSibling(&tmp.path().join("pack.tar.zst")),
+            &snap_dir,
+        );
+        assert!(
+            good_res.is_ok(),
+            "safe single-component target_path must be accepted"
+        );
+    }
+
+    /// Review #295 blocker 3 / 2026-08-22: the exact same-tag regression.
+    /// Re-snapshotting a tag whose RW baseline IS the tag's own
+    /// `snap_dir/rootfs.ext4` must be flagged as a self-clone (so a re-run
+    /// can't delete its own source during publish). `rootfs_clone_into_self`
+    /// compares against the FINAL `snap_dir/rootfs.ext4` path, not a
+    /// transient staging path.
+    #[test]
+    fn rootfs_clone_into_self_rejects_same_tag_rootfs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let snap_dir = tmp.path().join("py");
+        std::fs::create_dir_all(&snap_dir).unwrap();
+        // The tag's own rootfs.ext4 already exists (a prior snapshot).
+        let existing = snap_dir.join("rootfs.ext4");
+        std::fs::write(&existing, b"existing-rootfs").unwrap();
+
+        // Passing the existing tag's own rootfs.ext4 as the baseline = self-clone.
+        assert!(
+            rootfs_clone_into_self(&existing, &snap_dir),
+            "baseline == snap_dir/rootfs.ext4 must be flagged as self-clone"
+        );
+
+        // A genuinely distinct baseline is NOT a self-clone.
+        let other = tmp.path().join("baseline.ext4");
+        std::fs::write(&other, b"different-rootfs").unwrap();
+        assert!(
+            !rootfs_clone_into_self(&other, &snap_dir),
+            "a distinct baseline must not be flagged as self-clone"
+        );
+
+        // Relative path resolving to the same inode is still flagged.
+        assert!(
+            rootfs_clone_into_self(&existing, &snap_dir),
+            "same file via same path must be flagged"
+        );
+    }
+
+    /// Review #295 blocker 1 / 2026-08-22 Linux+KVM regression (the
+    /// reviewer's explicit ask): a snapshot whose rootfs lives at the
+    /// STABLE `snap_dir/rootfs.ext4` — and whose staging dir is gone after
+    /// publish — must restore from the published tag. The blocker-1 fix
+    /// matters because Firecracker serializes the drive `path_on_host`
+    /// into the binary vmstate and reopens THAT path on `/snapshot/load`
+    /// (no PUT /drives override is accepted). Previously the clone booted
+    /// from a transient `staging_dir/rootfs.ext4` that vanish on publish,
+    /// so the first restore failed. This test boots, snapshots to a
+    /// staging dir, publishes metadata (rootfs already at the stable
+    /// path), confirms staging is cleared, then restores and pings the
+    /// guest.
+    ///
+    /// Needs Linux + KVM + firecracker + an ext4 rootfs image (see
+    /// FORKD_TEST_KERNEL / FORKD_TEST_ROOTFS). Mirrors the forkd-vmm
+    /// `kvm_clock_survives_snapshot_restore` harness.
+    #[test]
+    #[ignore = "requires Linux + KVM + firecracker + rootfs image"]
+    #[cfg(target_os = "linux")]
+    fn snapshot_stable_rootfs_publishes_and_restores() {
+        let kernel = std::env::var("FORKD_TEST_KERNEL")
+            .unwrap_or_else(|_| "/var/lib/forkd/kernels/vmlinux".to_string());
+        let baseline = std::env::var("FORKD_TEST_ROOTFS")
+            .expect("FORKD_TEST_ROOTFS must point to an ext4 rootfs image");
+        assert!(
+            std::path::Path::new(&kernel).exists(),
+            "FORKD_TEST_KERNEL not found"
+        );
+        assert!(
+            std::path::Path::new(&baseline).exists(),
+            "FORKD_TEST_ROOTFS not found"
+        );
+
+        let root = std::env::temp_dir().join(format!(
+            "forkd-snapshot-stable-rootfs-{}",
+            std::process::id()
+        ));
+        let snap_dir = root.join("snap");
+        let work_dir = root.join("work");
+        let staging = root.join("snap.staging");
+        let restore_dir = root.join("restore");
+        for p in [&root, &snap_dir, &work_dir, &restore_dir] {
+            let _ = std::fs::remove_dir_all(p);
+        }
+
+        // Clone the baseline to the STABLE final rootfs path (blocker-1
+        // fix: the VM boots from where the clone will persist after
+        // publish).
+        std::fs::create_dir_all(&snap_dir).unwrap();
+        let final_rootfs = snap_dir.join("rootfs.ext4");
+        forkd_vmm::chain::reflink_copy(std::path::Path::new(&baseline), &final_rootfs)
+            .expect("clone baseline to stable rootfs path");
+
+        // Boot from the stable path; snapshot vmstate+memory into staging.
+        let cfg = BootConfig::ext4_rw(
+            std::path::PathBuf::from(kernel),
+            final_rootfs.clone(),
+            work_dir.clone(),
+        );
+        let mut vm = Vm::boot(&cfg).expect("boot parent VM from stable rootfs");
+        let _ = ping_at("10.42.0.2:8888"); // best-effort warmup
+        vm.pause().expect("pause parent");
+        let snap = vm
+            .snapshot_to(
+                staging.join("vmstate"),
+                staging.join("memory.bin"),
+                Vec::new(),
+            )
+            .expect("snapshot to staging");
+        vm.kill().expect("kill parent");
+
+        // Mirror snapshot_cmd: write the Snapshot metadata (with its rootfs
+        // path) into staging so publish_snapshot_metadata's all-three-files
+        // pre-check passes and the published snapshot is restorable.
+        let meta = serde_json::to_vec_pretty(&snap).expect("serialize snapshot meta");
+        std::fs::write(staging.join("snapshot.json"), meta).expect("write staging snapshot.json");
+
+        // Publish metadata only — the rootfs stays at the stable path.
+        publish_snapshot_metadata(&staging, &snap_dir).expect("publish metadata");
+        // Confirm the transient staging artifacts are gone (reviewer ask).
+        assert!(
+            !staging.join("vmstate").exists()
+                && !staging.join("memory.bin").exists()
+                && !staging.join("snapshot.json").exists(),
+            "staging must be cleared after publish"
+        );
+        // Rootfs still at the stable final path (not moved/renamed).
+        assert!(
+            final_rootfs.exists(),
+            "rootfs must remain at the stable final path"
+        );
+
+        // Restore from the published tag: the vmstate reopens
+        // snap_dir/rootfs.ext4 (the recorded path), which still exists.
+        let opts = ForkOpts {
+            n: 1,
+            memory_backend: forkd_vmm::MemoryBackend::File,
+            ..ForkOpts::default()
+        };
+        let res = snap
+            .restore_many_with(opts, &restore_dir)
+            .expect("restore from published tag must succeed (blocker-1)");
+        assert_eq!(res.children.len(), 1, "one child expected after restore");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

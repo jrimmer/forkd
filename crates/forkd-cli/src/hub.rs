@@ -242,14 +242,20 @@ pub fn pack(
     // the pack is produced without a portable rootfs and will only
     // restore on the packing host.
     let rootfs = emit_rootfs_sidecar(snap_dir, out_path)?;
-    // When a portable sidecar was emitted, exclude rootfs.ext4 from the
-    // tar body (it's already counted in `files` for manifest integrity).
-    // The tar append loop below skips any entry whose path equals the
-    // rootfs filename when a sidecar is present.
+    // Review #295 blocker 2 / 2026-08-22: when a portable sidecar was
+    // emitted, rootfs.ext4 is NOT in the tar body and must NOT be listed
+    // in `manifest.files` — otherwise unpack's verification (which checks
+    // every declared file BEFORE satisfy_rootfs runs) would hash the
+    // missing extracted rootfs and fail before the sidecar could ever be
+    // placed. The sidecar carries the rootfs integrity itself via
+    // RootfsRef.sha256.
     let rootfs_filename: Option<String> = rootfs
         .as_ref()
         .and_then(|r| Path::new(&r.target_path).file_name())
         .map(|s| s.to_string_lossy().into_owned());
+    if let Some(ref rf) = rootfs_filename {
+        files.retain(|e| e.path != *rf);
+    }
 
     let manifest = Manifest {
         forkd_pack_version: PACK_FORMAT_VERSION_V1,
@@ -288,14 +294,9 @@ pub fn pack(
         .context("append manifest.toml")?;
 
     for entry in &files {
-        // Review #295 r6 blocker 3: don't tar the rootfs when a portable
-        // sidecar was emitted — the sidecar is the single transport and
-        // tar'd rootfs.ext4 would just duplicate a huge image.
-        if let Some(ref rf) = rootfs_filename {
-            if entry.path == *rf {
-                continue;
-            }
-        }
+        // rootfs.ext4 is not in `files` when a portable sidecar was
+        // emitted (retain above removed it), so it is never tar'd — the
+        // sidecar is the single transport (review #295).
         let path = snap_dir.join(&entry.path);
         let mut f = File::open(&path).with_context(|| format!("open {}", path.display()))?;
         tar.append_file(&entry.path, &mut f)
@@ -1378,6 +1379,77 @@ mod tests {
             b"vmstate-bytes"
         );
         assert_eq!(std::fs::read(dst.join("memory.bin")).unwrap().len(), 4096);
+    }
+
+    /// Review #295 blocker 2 / 2026-08-22: a pack with a PORTABLE sidecar
+    /// must round-trip. Previously `pack` listed rootfs.ext4 in
+    /// `manifest.files` but omitted it from the tar (sidecar is the single
+    /// transport); `unpack` then verified every declared file, hashed the
+    /// missing extracted rootfs.ext4, and failed — so the sidecar could
+    /// never be placed. The fix removes rootfs.ext4 from `manifest.files`
+    /// when a sidecar is emitted, so unpack succeeds and the single rootfs
+    /// transport is the sidecar on disk next to the pack.
+    #[test]
+    fn pack_unpack_roundtrip_with_sidecar_rootfs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::write(src.join("vmstate"), b"vmstate-bytes").unwrap();
+        std::fs::write(src.join("memory.bin"), vec![0u8; 4096]).unwrap();
+        // A real rootfs file the snapshot.json will point at, so
+        // emit_rootfs_sidecar produces a portable sidecar.
+        let rootfs = src.join("rootfs.ext4");
+        let rootfs_bytes = vec![0xEEu8; 8192];
+        std::fs::write(&rootfs, &rootfs_bytes).unwrap();
+        let rootfs_sha = sha256_file(&rootfs).unwrap();
+        std::fs::write(
+            src.join("snapshot.json"),
+            format!(
+                r#"{{"vmstate":"x","memory":"y","rootfs":"{}","volumes":[]}}"#,
+                rootfs.display()
+            ),
+        )
+        .unwrap();
+
+        let pack_out = tmp.path().join("out.tar.zst");
+        let m = pack("test/with-rootfs", None, None, &src, &pack_out).expect("pack");
+        // A portable sidecar was emitted and rootfs.ext4 is NOT in the
+        // manifest files list (it lives only in the sidecar).
+        assert!(
+            m.rootfs.is_some(),
+            "snapshot recording a rootfs should emit a portable sidecar"
+        );
+        let rootfs_ref = m.rootfs.clone().unwrap();
+        assert_eq!(rootfs_ref.sha256, rootfs_sha);
+        assert!(
+            !m.files.iter().any(|f| f.path == "rootfs.ext4"),
+            "rootfs.ext4 must NOT be in manifest.files when a sidecar is emitted"
+        );
+        // The single rootfs transport exists on disk next to the pack.
+        let sidecar_name = rootfs_sidecar_name(&rootfs_sha);
+        assert!(
+            pack_out.parent().unwrap().join(&sidecar_name).exists(),
+            "sidecar {:?} should exist next to the pack",
+            sidecar_name
+        );
+
+        // Unpack MUST succeed now (previously it failed verifying the
+        // missing extracted rootfs.ext4).
+        let dst = tmp.path().join("dst");
+        let m2 = unpack(&pack_out, &dst).expect("unpack with sidecar should succeed");
+        assert_eq!(m2.rootfs.as_ref().unwrap().sha256, rootfs_sha);
+        // Non-rootfs files were extracted and verified.
+        assert_eq!(
+            std::fs::read(dst.join("vmstate")).unwrap(),
+            b"vmstate-bytes"
+        );
+        // The rootfs itself is NOT extracted into the snapshot dir by
+        // unpack (it stays in the sidecar; satisfy_rootfs places it on
+        // restore).
+        assert!(
+            !dst.join("rootfs.ext4").exists(),
+            "rootfs should be transported only via the sidecar, not the tar"
+        );
     }
 
     // Path-traversal rejection is intentionally not unit-tested here:
