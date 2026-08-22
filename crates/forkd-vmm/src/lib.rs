@@ -1183,12 +1183,52 @@ const CLOCK_SYNC_EXEC_TIMEOUT: Duration = Duration::from_secs(5);
 /// - **Adds latency to restore**: ~1-5 seconds per batch (agent polling
 ///   + exec), running in parallel across children. Measured at
 ///     ~1-2 seconds for typical Debian/Ubuntu-based images.
-fn sync_guest_clocks(children: &[&Vm]) -> (u128, Vec<ClockSyncOutcome>) {
+/// Map a `Vec<Option<T>>` of per-slot children (failed slots are `None`)
+/// into a slice of `(original_1_based_slot, &T)` for the live children,
+/// where `original_1_based_slot` is the index the child occupied in the
+/// *original* batch (1-based) — **before** failures were filtered out.
+///
+/// This is the single source of truth for the index-preserving mapping
+/// that `restore_many_with` passes into `sync_guest_clocks`. Hardcoding
+/// what would otherwise be an inline `enumerate().filter_map(...)` makes
+/// the invariant unit-testable without KVM: a hole (a `None` slot)
+/// earlier in the batch must not renumber a later survivor's index
+/// (review feedback on #302 — `children::flatten()` loses the slot).
+///
+/// Example: `[None, Some(a), None, Some(b)] -> [(2, a), (4, b)]`.
+pub fn live_children_with_indices<T>(children: &[Option<T>]) -> Vec<(usize, &T)> {
+    children
+        .iter()
+        .enumerate()
+        .filter_map(|(i, c)| c.as_ref().map(|vm| (i + 1, vm)))
+        .collect()
+}
+
+/// Sync each restored child's guest clock to host wall time.
+///
+/// # Indexing contract
+///
+/// `children` is a slice of `(child_index, &Vm)` where `child_index` is
+/// the **1-based within-batch slot** the child originally occupied in
+/// `restore_many_with` (matching `ForkChild.child_index` and
+/// `RestoreFailure.child_index`). `ClockSyncOutcome.child_index` echoes
+/// that original slot.
+///
+/// Pass the live children flattened from `Vec<Option<Vm>>` only *after*
+/// pairing each with its original index; do **not** re-enumerate the
+/// flattened slice, otherwise a hole (failed spawn/socket-wait) shifts
+/// every later survivor's reported index and breaks resource correlation
+/// (review feedback on #302: `children::flatten()` renumbers outcomes).
+fn sync_guest_clocks(children: &[(usize, &Vm)]) -> (u128, Vec<ClockSyncOutcome>) {
     let start = Instant::now();
 
     let mut handles = Vec::with_capacity(children.len());
     for child in children.iter() {
-        let netns = child.netns.clone();
+        // `child.1` is the `&Vm`; borrow fields before moving netns into
+        // the spawn closure. (`child.0`'s original slot is reported via
+        // `children[i].0` in the collect loop below.)
+        let (_, vm) = *child;
+        let netns = vm.netns.clone();
         handles.push(thread::spawn(move || -> Result<()> {
             let addr = GUEST_AGENT_ADDR.to_string();
 
@@ -1266,33 +1306,38 @@ fn sync_guest_clocks(children: &[&Vm]) -> (u128, Vec<ClockSyncOutcome>) {
     let mut synced = 0usize;
     let mut failed = 0usize;
     for (i, h) in handles.into_iter().enumerate() {
+        // `children[i].0` is the ORIGINAL 1-based within-batch slot the
+        // child occupied before failures were filtered out. Use it for
+        // both the tracing spans and `ClockSyncOutcome.child_index` so a
+        // survivor is never re-numbered by flattening (review #302).
+        let slot = children[i].0;
         match h.join() {
             Ok(Ok(())) => {
                 synced += 1;
-                outcomes.push(ClockSyncOutcome::Synced { child_index: i });
+                outcomes.push(ClockSyncOutcome::Synced { child_index: slot });
             }
             Ok(Err(e)) => {
                 failed += 1;
                 let error = format!("{e:#}");
                 tracing::warn!(
-                    child = i + 1,
+                    child = slot,
                     "guest clock sync failed: {error}; \
                      sandbox will have a stale clock"
                 );
                 outcomes.push(ClockSyncOutcome::Failed {
-                    child_index: i,
+                    child_index: slot,
                     error,
                 });
             }
             Err(_) => {
                 failed += 1;
                 tracing::warn!(
-                    child = i + 1,
+                    child = slot,
                     "guest clock sync thread panicked; \
                      sandbox will have a stale clock"
                 );
                 outcomes.push(ClockSyncOutcome::Failed {
-                    child_index: i,
+                    child_index: slot,
                     error: "clock sync thread panicked".to_string(),
                 });
             }
@@ -2369,9 +2414,11 @@ impl Snapshot {
             //
             // `sync_guest_clocks` only reads `child.netns` (cloned into the
             // sync thread) so it does not need to own the `Vm`. Pass the
-            // live children by reference; `Vm` is not `Clone` (it owns a
+            // live children by reference, preserving each child's ORIGINAL
+            // 1-based slot (review #302: flattening would renumber a
+            // survivor past a failed hole). `Vm` is not `Clone` (it owns a
             // Child process).
-            let live: Vec<&Vm> = children.iter().flatten().collect();
+            let live: Vec<(usize, &Vm)> = live_children_with_indices(&children);
             sync_guest_clocks(&live)
         } else {
             (0, Vec::new())
@@ -3679,6 +3726,61 @@ mod tests {
         assert!(failures[0].contains("agent timeout"));
     }
 
+    /// Regression (review #302): the index-preserving mapping that feeds
+    /// `sync_guest_clocks` must NOT renumber a survivor past a hole.
+    ///
+    /// `restore_many_with` keeps per-slot results as `Vec<Option<Vm>>`
+    /// (failed spawn/socket-wait slots are `None`). A naive
+    /// `children.iter().flatten()` re-indexes the survivors, so with
+    /// `[None, Some(a), None, Some(b)]` the flattened slice is `[a, b]`
+    /// and `enumerate()` would report them as slots 0/1 instead of the
+    /// original 2/4 — breaking the resource correlation that
+    /// `ForkChild`/`RestoreFailure`/`ClockSyncOutcome` all promise via
+    /// their 1-based within-batch index. Use cheap `u32` payloads so this
+    /// is a portable, KVM-free unit test.
+    #[test]
+    fn live_children_with_indices_preserves_survivor_slot_across_hole() {
+        // Vec positions 0 and 2 are None (failed), positions 1 and 3 are
+        // live. The survivors must retain their ORIGINAL 1-based slots
+        // (2 and 4), not be renumbered to 0/1 by flattening.
+        let children: Vec<Option<u32>> = vec![None, Some(10), None, Some(30)];
+        let live = live_children_with_indices(&children);
+
+        assert_eq!(
+            live.len(),
+            2,
+            "two live children expected from 2 holes + 2 survivors"
+        );
+        assert_eq!(live[0], (2, &10), "first survivor keeps slot 2");
+        assert_eq!(live[1], (4, &30), "second survivor keeps slot 4");
+
+        // And the adjacency case: no holes → indices map 1..=n in order.
+        let all: Vec<Option<u32>> = vec![Some(1), Some(2), Some(3)];
+        let live_all = live_children_with_indices(&all);
+        assert_eq!(
+            live_all.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+
+        // All failures → empty result.
+        let none: Vec<Option<u32>> = vec![None, None];
+        assert!(live_children_with_indices(&none).is_empty());
+
+        // Trailing hole: the live child keeps its slot even when the tail
+        // is empty.
+        let trailing: Vec<Option<u32>> = vec![Some(5), None];
+        assert_eq!(live_children_with_indices(&trailing), vec![(1, &5)]);
+
+        // First-live-then-holes: a survivor followed only by holes keeps
+        // its (first) slot.
+        let first_live: Vec<Option<u32>> = vec![Some(9), None, None];
+        assert_eq!(live_children_with_indices(&first_live), vec![(1, &9)]);
+
+        // Empty input → empty result.
+        let empty: Vec<Option<u32>> = Vec::new();
+        assert!(live_children_with_indices(&empty).is_empty());
+    }
+
     /// Integration test: sync_guest_clocks corrects a deliberately-wrong
     /// guest clock. This isolates the scripting solution — even if the
     /// kernel's KVM_CLOCK_REALTIME already corrected the clock after
@@ -3774,8 +3876,10 @@ mod tests {
 
         // Step 3: Run sync_guest_clocks — this is what #300 adds after
         // restore. The function captures host wall time and execs
-        // `sh -c "date -s @<host_ts>"` in each child VM.
-        let (elapsed_ms, outcomes) = sync_guest_clocks(std::slice::from_ref(&&vm));
+        // `sh -c "date -s @<host_ts>"` in each child VM. The single
+        // child is passed as slot 1 (1-based within-batch), so its
+        // outcome must report child_index = 1.
+        let (elapsed_ms, outcomes) = sync_guest_clocks(&[(1, &vm)]);
         assert!(
             elapsed_ms < 30_000,
             "sync_guest_clocks took {elapsed_ms}ms, expected < 30s"
@@ -3788,8 +3892,8 @@ mod tests {
             outcomes.len()
         );
         assert!(
-            matches!(&outcomes[0], ClockSyncOutcome::Synced { child_index: 0 }),
-            "expected Synced{{child_index: 0}}, got {:?}",
+            matches!(&outcomes[0], ClockSyncOutcome::Synced { child_index: 1 }),
+            "expected Synced{{child_index: 1}}, got {:?}",
             outcomes[0]
         );
 
