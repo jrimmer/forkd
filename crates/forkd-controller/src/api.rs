@@ -320,6 +320,25 @@ pub struct SandboxInfo {
     /// killing an unidentifiable process").
     #[serde(default)]
     pub proc_starttime: Option<u64>,
+    /// Linux boot identity (`/proc/sys/kernel/random/boot_id`) captured
+    /// at VM registration, alongside `proc_starttime`.
+    ///
+    /// `proc_starttime` is ticks since boot and is therefore only unique
+    /// *within* a single boot. The registry persists across host reboots
+    /// (`/var/lib/forkd/state.json`), so after a reboot an unrelated
+    /// Firecracker can in principle share both the numeric PID and the
+    /// boot-relative start tick of a recorded entry; a bare starttime
+    /// check would then report `Match` and SIGKILL the wrong process
+    /// (review #299). We persist the boot id at registration and verify
+    /// it on recovery: a different boot id means the old process cannot
+    /// still exist (prune without signaling); a missing/unreadable boot
+    /// id fails closed (do not kill).
+    ///
+    /// `#[serde(default)]` keeps older `state.json` entries loadable;
+    /// entries written before this field deserialize to `None`, which
+    /// fails closed on the kill path.
+    #[serde(default)]
+    pub boot_id: Option<String>,
     pub memory_limit_mib: Option<u64>,
     /// Set to true once any BRANCH (Full or Diff) has been taken from
     /// this sandbox. Diagnostic flag — phase 1d (v0.3.1) lifted the

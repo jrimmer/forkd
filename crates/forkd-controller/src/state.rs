@@ -323,15 +323,35 @@ impl Registry {
     /// the allocator may still collide with them — the caller should
     /// log the failure count and the operator should investigate.
     pub(crate) fn kill_orphans(&self) -> Result<KillOrphansResult> {
-        // Collect orphans with their recorded durable identity (start time).
-        // The lock is dropped before any kill so the (bounded) wait_for_death
-        // poll never holds the registry mutex.
-        let orphans: Vec<(String, u32, Option<u64>)> = {
+        // Count retained sandbox rows that have NO recorded PID before we
+        // prune/kill. Such an entry is legacy/corrupt identity (every
+        // production registration path writes `Some(pid)`), but the
+        // absence of a PID is NOT evidence that no live VM is holding its
+        // netns/tap resources — on the contrary, it mirrors the #298
+        // collision risk if we simply skip it and start with an empty
+        // allocator. The caller treats `unresolved > 0` as a startup
+        // blocker (fail closed).
+        let unresolved: usize = {
+            self.inner
+                .lock()
+                .sandboxes
+                .values()
+                .filter(|sb| sb.pid.is_none())
+                .count()
+        };
+
+        // Collect orphans with their recorded durable identity
+        // (start time + boot id). The lock is dropped before any kill
+        // so the (bounded) wait_for_death poll never holds the registry
+        // mutex.
+        let orphans: Vec<(String, u32, Option<u64>, Option<String>)> = {
             let g = self.inner.lock();
             g.sandboxes
                 .iter()
                 .filter_map(|(id, sb)| match sb.pid {
-                    Some(pid) if pid_alive(pid) => Some((id.clone(), pid, sb.proc_starttime)),
+                    Some(pid) if pid_alive(pid) => {
+                        Some((id.clone(), pid, sb.proc_starttime, sb.boot_id.clone()))
+                    }
                     _ => None,
                 })
                 .collect()
@@ -341,13 +361,14 @@ impl Registry {
         let mut pruned_stale = 0usize;
         let mut kill_failed = 0usize;
 
-        for (id, pid, recorded_starttime) in orphans {
+        for (id, pid, recorded_starttime, recorded_boot_id) in orphans {
             // Primary identity check: compare the live process start time
-            // against the one recorded at registration. This is the
-            // durable identity that survives PID reuse — `comm` alone
-            // is spoofable and cannot distinguish two Firecracker
-            // processes that happen to share a PID over time.
-            match process_identity_matches(pid, recorded_starttime) {
+            // (gated by the persisted boot id) against the record at
+            // registration. This is the durable identity that survives
+            // PID reuse — `comm` alone is spoofable and cannot distinguish
+            // two Firecracker processes that happen to share a PID over
+            // time (or across a host reboot).
+            match process_identity_matches(pid, recorded_starttime, recorded_boot_id.as_deref()) {
                 IdentityCheck::Match => {
                     // Same process (start time matches). Open a pidfd
                     // NOW, after the identity check, so the signal is
@@ -539,6 +560,7 @@ impl Registry {
             killed,
             pruned_stale,
             kill_failed,
+            unresolved,
         })
     }
 
@@ -550,12 +572,20 @@ impl Registry {
 }
 
 /// Result of `kill_orphans`: how many were actually killed, pruned as
-/// stale (PID reuse / already dead), and how many kills failed.
+/// stale (PID reuse / already dead), how many kills failed, and how many
+/// retained rows were unresolvable (no recorded PID).
 #[derive(Debug, Default, Clone, Copy)]
 pub struct KillOrphansResult {
     pub killed: usize,
     pub pruned_stale: usize,
     pub kill_failed: usize,
+    /// Retained sandbox entries whose `pid` is `None`. This is a
+    /// startup blocker: it means a previous controller left a row we
+    /// cannot attribute to any live or dead process, so we cannot prove
+    /// its netns/tap resources are free. Treating it as skippable would
+    /// recreate the #298 collision risk (startup succeeds with an empty
+    /// allocator while a live VM may still hold those resources).
+    pub unresolved: usize,
 }
 
 #[cfg(target_os = "linux")]
@@ -622,6 +652,35 @@ enum IdentityCheck {
     Unknown,
 }
 
+/// Read the Linux boot identity from `/proc/sys/kernel/random/boot_id`.
+/// This is a UUID that changes on every host reboot.
+///
+/// `proc_starttime` (ticks since boot) is only meaningful *within* a single
+/// boot: it is not unique across reboots. Two processes in different boots
+/// can share both a numeric PID and a boot-relative start tick. Since the
+/// registry persists across reboots (`/var/lib/forkd/state.json`), a
+/// bare starttime is insufficient to prove a recorded PID is the same
+/// still-alive Firecracker after the host has rebooted. We therefore also
+/// persist the boot identity at registration and verify it on recovery
+/// (review #299: cross-reboot PID+starttick reuse).
+///
+/// Returns `None` when the boot id cannot be read (unlikely on Linux; e.g.
+/// no `/proc`, or a constrained container). Off-Linux this returns `None`.
+#[cfg(target_os = "linux")]
+pub(crate) fn read_boot_id() -> Option<String> {
+    let raw = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
+    let boot_id = raw.trim();
+    if boot_id.is_empty() {
+        return None;
+    }
+    Some(boot_id.to_string())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn read_boot_id() -> Option<String> {
+    None
+}
+
 /// Read field 22 (starttime, clock ticks since boot) from
 /// `/proc/<pid>/stat`. Returns `None` if the process is gone or the
 /// file cannot be parsed.
@@ -656,10 +715,23 @@ pub(crate) fn read_proc_starttime(_pid: u32) -> Option<u64> {
 }
 
 /// Compare a recorded process identity against the live process at the
-/// same PID. On Linux this is the start-time comparison; off-Linux it is
-/// always `Unknown` (no `/proc` to read).
+/// same PID. On Linux this compares (a) the boot identity and (b) the
+/// start time; off-Linux it is always `Unknown` (no `/proc` to read).
+///
+/// `recorded_boot_id` is the persisted `/proc/sys/kernel/random/boot_id`
+/// captured at registration. A mismatch with the current boot id means the
+/// recorded process belonged to a previous boot, so it cannot still be
+/// alive — we prune without signaling (`PidReuse`). A `None` recorded boot
+/// id (legacy `state.json` written before the field existed, or a process
+/// registered when the boot id was unreadable) means we cannot prove which
+/// boot the process belongs to, so we FAIL CLOSED (`Unknown`) rather than
+/// risk a cross-reboot false match (review #299).
 #[cfg(target_os = "linux")]
-fn process_identity_matches(pid: u32, recorded_starttime: Option<u64>) -> IdentityCheck {
+fn process_identity_matches(
+    pid: u32,
+    recorded_starttime: Option<u64>,
+    recorded_boot_id: Option<&str>,
+) -> IdentityCheck {
     if pid <= 1 {
         return IdentityCheck::Unknown;
     }
@@ -668,6 +740,31 @@ fn process_identity_matches(pid: u32, recorded_starttime: Option<u64>) -> Identi
         // existed). We cannot prove the live PID is ours — fail closed.
         return IdentityCheck::Unknown;
     };
+    // Boot identity gates the start-time comparison. If we cannot confirm
+    // the recorded process was (or is) from the CURRENT boot, we must not
+    // signal it: a cross-reboot PID+starttick collision would otherwise be
+    // a false `Match` against an unrelated Firecracker.
+    match recorded_boot_id {
+        None => {
+            // Missing recorded boot id → cannot prove current boot → fail
+            // closed (do not kill).
+            return IdentityCheck::Unknown;
+        }
+        Some(rec) => match read_boot_id() {
+            None => {
+                // Live boot id unreadable → fail closed.
+                return IdentityCheck::Unknown;
+            }
+            Some(live) if live != rec => {
+                // The recorded process is from a previous boot; it cannot
+                // still be alive. Safe to prune without signaling.
+                return IdentityCheck::PidReuse;
+            }
+            Some(_live_matching) => {
+                // Same boot — proceed to the start-time check below.
+            }
+        },
+    }
     let path = format!("/proc/{pid}");
     if !std::path::Path::new(&path).exists() {
         return IdentityCheck::Dead;
@@ -680,7 +777,11 @@ fn process_identity_matches(pid: u32, recorded_starttime: Option<u64>) -> Identi
 }
 
 #[cfg(not(target_os = "linux"))]
-fn process_identity_matches(_pid: u32, _recorded_starttime: Option<u64>) -> IdentityCheck {
+fn process_identity_matches(
+    _pid: u32,
+    _recorded_starttime: Option<u64>,
+    _recorded_boot_id: Option<&str>,
+) -> IdentityCheck {
     IdentityCheck::Unknown
 }
 
@@ -794,6 +895,10 @@ mod tests {
             guest_addr: "10.42.0.2:8888".into(),
             created_at_unix: 1,
             proc_starttime: None,
+            // Recorded against the CURRENT boot so identity checks that
+            // expect a match (same boot) pass; tests that need a
+            // cross-boot mismatch set this explicitly.
+            boot_id: read_boot_id(),
             pid: Some(99999999),
             memory_limit_mib: None,
             has_branched: false,
@@ -971,6 +1076,7 @@ mod tests {
             created_at_unix: 1,
             pid: Some(std::process::id()),
             proc_starttime: Some(u64::MAX), // mismatched → PidReuse
+            boot_id: read_boot_id(),
             memory_limit_mib: None,
             has_branched: false,
             last_branch_memory_path: None,
@@ -990,6 +1096,7 @@ mod tests {
             created_at_unix: 2,
             pid: Some(99999999),
             proc_starttime: Some(u64::MAX), // mismatched → PidReuse
+            boot_id: read_boot_id(),
             memory_limit_mib: None,
             has_branched: false,
             last_branch_memory_path: None,
@@ -1014,6 +1121,77 @@ mod tests {
         assert!(r.list_sandboxes().is_empty());
     }
 
+    /// Regression (review #299): a recorded PID whose start time MATCHES
+    /// the live process but whose recorded boot id differs from the
+    /// current boot must NOT be killed.
+    ///
+    /// `proc_starttime` is ticks since boot and is only unique within one
+    /// host boot. The registry persists across reboots, so after a host
+    /// reboot an unrelated Firecracker can in principle share both the
+    /// numeric PID and the boot-relative start tick with a recorded
+    /// entry; a bare starttime check would then report `Match` and SIGKILL
+    /// the wrong process. The boot id gate must turn that into a prune
+    /// WITHOUT signaling: a different boot id means the recorded process
+    /// (from the old boot) cannot still exist.
+    ///
+    /// We record the CURRENT real start time (so the starttime check would
+    /// otherwise Match) but a recording of boot_id that differs from this
+    /// boot (simulating a state.json carried across a reboot).
+    #[test]
+    #[cfg(target_os = "linux")] // needs a real process + /proc to prove Match-able identity
+    fn kill_orphans_does_not_kill_across_boot_id_mismatch() {
+        let td = TempDir::new().unwrap();
+        let path = td.path().join("state.json");
+        let r = Registry::load_or_init(&path).unwrap();
+
+        // Spawn a real child (our own process will do — use the test's own
+        // PID so it is alive; record its TRUE boot id-matching context but
+        // store a DIFFERENT boot id in the registry). Using std::process::id()
+        // keeps this deterministic and alive; the current boot id is read
+        // fresh and a NONSENSE different boot id is persisted.
+        let pid = std::process::id();
+        let real_starttime = read_proc_starttime(pid).expect("read own starttime");
+        // This boot's actual id, from a boot that does NOT match the
+        // recorded value we are about to persist.
+        let _current_boot = read_boot_id();
+
+        // Persist an entry for OUR live PID with the REAL start time (so a
+        // starttime-only check WOULD Match), but a boot id that is certainly
+        // different from the current one. The boot gate must reject it
+        // before the starttime check runs.
+        r.insert_sandbox(SandboxInfo {
+            id: "sb-cross-boot".into(),
+            snapshot_tag: "py".into(),
+            netns: Some("forkd-child-1".into()),
+            guest_addr: "10.42.0.2:8888".into(),
+            created_at_unix: 1,
+            pid: Some(pid),
+            proc_starttime: Some(real_starttime),
+            // Guaranteed-different boot id (UUIDs are unique across boots;
+            // a fresh random-looking value cannot equal the current boot's).
+            boot_id: Some("00000000-0000-0000-0000-000000000000".to_string()),
+            memory_limit_mib: None,
+            has_branched: false,
+            last_branch_memory_path: None,
+            branch_count: 0,
+        })
+        .unwrap();
+
+        let result = r.kill_orphans().unwrap();
+        // The boot gate turns a would-be Match into a PidReuse → prune
+        // WITHOUT signaling (killed stays 0).
+        assert_eq!(
+            result.killed, 0,
+            "must NOT kill a process whose recorded boot id differs from current boot"
+        );
+        assert_eq!(
+            result.pruned_stale, 1,
+            "cross-boot stale entry must be pruned without signaling"
+        );
+        assert_eq!(result.kill_failed, 0);
+        assert!(r.list_sandboxes().is_empty());
+    }
+
     /// New: an alive-PID entry with NO recorded start time (old state.json
     /// written before proc_starttime existed) must FAIL CLOSED — the entry
     // is kept and kill_failed is incremented, so the caller aborts startup
@@ -1035,6 +1213,9 @@ mod tests {
             created_at_unix: 1,
             pid: Some(std::process::id()),
             proc_starttime: None, // old state.json — identity unknown
+            // Legacy entry with no boot id — we cannot verify which boot
+            // it belongs to, so the kill path fails closed (Unknown).
+            boot_id: None,
             memory_limit_mib: None,
             has_branched: false,
             last_branch_memory_path: None,
@@ -1089,6 +1270,7 @@ mod tests {
             created_at_unix: 1,
             pid: Some(std::process::id()),
             proc_starttime: Some(0), // real start time is > 0; 0 cannot match
+            boot_id: read_boot_id(),
             memory_limit_mib: None,
             has_branched: false,
             last_branch_memory_path: None,
@@ -1123,6 +1305,7 @@ mod tests {
             created_at_unix: 1,
             pid: Some(std::process::id()),
             proc_starttime: Some(u64::MAX), // mismatched → PidReuse
+            boot_id: read_boot_id(),
             memory_limit_mib: None,
             has_branched: false,
             last_branch_memory_path: None,
@@ -1169,21 +1352,29 @@ mod tests {
     }
 
     #[test]
-    fn kill_orphans_skips_pid_none_entries() {
+    fn kill_orphans_counts_pid_none_entries_as_unresolved() {
         let td = TempDir::new().unwrap();
         let path = td.path().join("state.json");
         let r = Registry::load_or_init(&path).unwrap();
 
-        // Insert a sandbox with pid: None — should be skipped by both
-        // reconcile() and kill_orphans() (the filter_map only collects
-        // Some(pid) entries).
+        // A sandbox row with pid: None is legacy/corrupt identity — every
+        // production registration path writes Some(pid). The absence of a
+        // PID is NOT evidence that no live VM holds the netns/tap it
+        // registered, so rather than silently skip it (which would recreate
+        // the #298 collision risk by starting with an empty allocator), it
+        // must be surfaced as `unresolved` so the caller blocks startup.
+        // Use a resource-holding shape (netns: Some(...)) to mirror the
+        // real #298 collision this protects against: the pid-less row's
+        // netns/tap may still be held by a live VM even though we can't
+        // attribute it to any PID.
         r.insert_sandbox(SandboxInfo {
             id: "sb-no-pid".into(),
             snapshot_tag: "py".into(),
-            netns: None,
+            netns: Some("forkd-child-1".into()),
             guest_addr: "10.42.0.2:8888".into(),
             created_at_unix: 1,
             proc_starttime: None,
+            boot_id: None,
             pid: None,
             memory_limit_mib: None,
             has_branched: false,
@@ -1197,8 +1388,16 @@ mod tests {
         assert_eq!(result.killed, 0);
         assert_eq!(result.pruned_stale, 0);
         assert_eq!(result.kill_failed, 0);
-        // Entry still exists — neither method touches pid:None entries.
+        // The pid:None row is surfaced as unresolved → startup blocker.
+        assert_eq!(
+            result.unresolved, 1,
+            "pid:None entry must be reported as unresolved, not skipped"
+        );
+        // Entry retained (not pruned) so the operator can inspect it.
         assert_eq!(r.list_sandboxes().len(), 1);
+
+        // And check_orphan_kill_result must fail closed on it.
+        assert!(crate::check_orphan_kill_result(&result).is_err());
     }
 
     #[test]
@@ -1218,6 +1417,7 @@ mod tests {
             created_at_unix: 1,
             pid: Some(std::process::id()),
             proc_starttime: Some(u64::MAX), // mismatched → PidReuse
+            boot_id: read_boot_id(),
             memory_limit_mib: None,
             has_branched: false,
             last_branch_memory_path: None,
@@ -1271,6 +1471,7 @@ mod tests {
             created_at_unix: 1,
             pid: Some(std::process::id()),
             proc_starttime: Some(u64::MAX), // mismatched → PidReuse
+            boot_id: read_boot_id(),
             memory_limit_mib: None,
             has_branched: false,
             last_branch_memory_path: None,
@@ -1301,6 +1502,7 @@ mod tests {
             guest_addr: "10.42.0.2:8888".into(),
             created_at_unix: 1,
             proc_starttime: Some(u64::MAX), // mismatched → PidReuse if it reaches kill_orphans
+            boot_id: read_boot_id(),
             pid: Some(99999999),
             memory_limit_mib: None,
             has_branched: false,
@@ -1318,6 +1520,7 @@ mod tests {
             created_at_unix: 2,
             pid: Some(std::process::id()),
             proc_starttime: Some(u64::MAX), // mismatched → PidReuse
+            boot_id: read_boot_id(),
             memory_limit_mib: None,
             has_branched: false,
             last_branch_memory_path: None,
@@ -1378,6 +1581,7 @@ mod tests {
             killed: 2,
             pruned_stale: 0,
             kill_failed: 1,
+            unresolved: 0,
         };
         let outcome = check_orphan_kill_result(&result);
         assert!(
@@ -1399,6 +1603,7 @@ mod tests {
             killed: 5,
             pruned_stale: 3,
             kill_failed: 0,
+            unresolved: 0,
         };
         assert!(
             check_orphan_kill_result(&result).is_ok(),
@@ -1417,6 +1622,7 @@ mod tests {
             killed: 0,
             pruned_stale: 0,
             kill_failed: 3,
+            unresolved: 0,
         };
         let err = check_orphan_kill_result(&result).unwrap_err().to_string();
         assert!(
@@ -1426,6 +1632,51 @@ mod tests {
         assert!(
             err.contains("could not be killed"),
             "error should explain the failure, got: {err}"
+        );
+    }
+
+    /// Startup-decision regression (review #299): a retained sandbox row
+    /// with no PID must block startup. Previously `kill_orphans` skipped
+    /// `pid: None` entries and `check_orphan_kill_result` only looked at
+    /// `kill_failed`, so the controller started with an empty allocator/
+    /// shared-tap ownership while a live VM might still hold those
+    /// resources — recreating the #298 collision risk.
+    #[test]
+    fn check_orphan_kill_result_aborts_on_unresolved() {
+        use crate::check_orphan_kill_result;
+
+        // unresolved > 0 (even with kill_failed == 0) must abort.
+        let result = KillOrphansResult {
+            killed: 0,
+            pruned_stale: 0,
+            kill_failed: 0,
+            unresolved: 2,
+        };
+        let outcome = check_orphan_kill_result(&result);
+        assert!(
+            outcome.is_err(),
+            "unresolved=2 must cause startup abort, got {outcome:?}"
+        );
+        let err = outcome.unwrap_err().to_string();
+        assert!(
+            err.contains("aborting startup"),
+            "error should mention aborting startup, got: {err}"
+        );
+        assert!(
+            err.contains('2'),
+            "error should contain unresolved count (2), got: {err}"
+        );
+
+        // unresolved == 0 and kill_failed == 0 must NOT abort.
+        let ok = KillOrphansResult {
+            killed: 1,
+            pruned_stale: 0,
+            kill_failed: 0,
+            unresolved: 0,
+        };
+        assert!(
+            check_orphan_kill_result(&ok).is_ok(),
+            "clean result should not abort startup"
         );
     }
 
@@ -1547,6 +1798,7 @@ mod tests {
             created_at_unix: 1,
             pid: Some(pid),
             proc_starttime: Some(starttime),
+            boot_id: read_boot_id(),
             memory_limit_mib: None,
             has_branched: false,
             last_branch_memory_path: None,
@@ -1670,6 +1922,7 @@ mod tests {
             created_at_unix: 1,
             pid: Some(pid),
             proc_starttime: Some(starttime),
+            boot_id: read_boot_id(),
             memory_limit_mib: None,
             has_branched: false,
             last_branch_memory_path: None,

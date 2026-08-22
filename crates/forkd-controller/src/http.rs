@@ -38,7 +38,7 @@ use crate::api::{
     ExecResponse, SandboxInfo, SnapshotInfo, SnapshotInfoDetail, SuspendWorkspaceRequest,
     VersionResponse, WorkspaceInfo, WorkspaceStatus,
 };
-use crate::state::{read_proc_starttime, Registry};
+use crate::state::{read_boot_id, read_proc_starttime, Registry};
 use forkd_vmm::ClockSyncOutcome;
 
 const API_VERSION: &str = "v1";
@@ -1539,6 +1539,7 @@ async fn create_sandbox(
                 created_at_unix: now,
                 pid: Some(vm.pid()),
                 proc_starttime: read_proc_starttime(vm.pid()),
+                boot_id: read_boot_id(),
                 memory_limit_mib: req.memory_limit_mib,
                 has_branched: false,
                 last_branch_memory_path: None,
@@ -2992,6 +2993,7 @@ fn spawn_one_for_workspace(
         created_at_unix: unix_now(),
         pid: Some(vm.pid()),
         proc_starttime: read_proc_starttime(vm.pid()),
+        boot_id: read_boot_id(),
         memory_limit_mib,
         has_branched: false,
         last_branch_memory_path: None,
@@ -3611,6 +3613,7 @@ mod tests {
             created_at_unix: unix_now(),
             pid: None,
             proc_starttime: None,
+            boot_id: None,
             memory_limit_mib: None,
             has_branched: false,
             last_branch_memory_path: None,
@@ -4656,6 +4659,7 @@ mod tests {
                 created_at_unix: 1,
                 pid: Some(99999999),
                 proc_starttime: None,
+                boot_id: None,
                 memory_limit_mib: None,
                 has_branched: false,
                 last_branch_memory_path: None,

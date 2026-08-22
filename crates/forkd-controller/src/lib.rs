@@ -96,6 +96,16 @@ pub(crate) fn check_orphan_kill_result(orphans: &crate::state::KillOrphansResult
             orphans.kill_failed
         );
     }
+    if orphans.unresolved > 0 {
+        anyhow::bail!(
+            "aborting startup: {} retained sandbox entr(y/ies) have no recorded PID and \
+             cannot be attributed to a live or dead process; refusing to start with an \
+             empty allocator/shared-tap ownership that may collide with a live VM still \
+             holding those resources (#298). Inspect the registry and remove/repair them, \
+             then restart.",
+            orphans.unresolved
+        );
+    }
     Ok(())
 }
 
@@ -122,13 +132,15 @@ pub async fn run_daemon(cfg: DaemonConfig) -> Result<()> {
             killed = orphans.killed,
             pruned_stale = orphans.pruned_stale,
             kill_failed = orphans.kill_failed,
+            unresolved = orphans.unresolved,
             "killed orphaned Firecracker processes on startup"
         );
-    } else if orphans.pruned_stale > 0 || orphans.kill_failed > 0 {
+    } else if orphans.pruned_stale > 0 || orphans.kill_failed > 0 || orphans.unresolved > 0 {
         tracing::warn!(
             pruned_stale = orphans.pruned_stale,
             kill_failed = orphans.kill_failed,
-            "orphan recovery: some entries pruned as stale or kill failed"
+            unresolved = orphans.unresolved,
+            "orphan recovery: some entries pruned as stale, unresolved, or kill failed"
         );
     }
 
