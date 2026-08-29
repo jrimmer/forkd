@@ -323,6 +323,10 @@ impl Registry {
     /// the allocator may still collide with them — the caller should
     /// log the failure count and the operator should investigate.
     pub(crate) fn kill_orphans(&self) -> Result<KillOrphansResult> {
+        // One collected orphan: (sandbox id, pid, recorded start time,
+        // recorded boot id).
+        type OrphanRow = (String, u32, Option<u64>, Option<String>);
+
         // Single lock pass over retained rows (review #299 non-blocking:
         // fold the previous two acquisitions into one guard):
         //  - `unresolved`: rows with NO recorded PID. Such an entry is
@@ -336,7 +340,7 @@ impl Registry {
         //    recorded durable identity (start time + boot id). The lock
         //    is dropped before any kill so the (bounded) wait_for_death
         //    poll never holds the registry mutex.
-        let (unresolved, orphans): (usize, Vec<(String, u32, Option<u64>, Option<String>)>) = {
+        let (unresolved, orphans): (usize, Vec<OrphanRow>) = {
             let g = self.inner.lock();
             let mut unresolved = 0usize;
             let mut orphans = Vec::new();
