@@ -38,7 +38,7 @@ use crate::api::{
     ExecResponse, SandboxInfo, SnapshotInfo, SnapshotInfoDetail, SuspendWorkspaceRequest,
     VersionResponse, WorkspaceInfo, WorkspaceStatus,
 };
-use crate::state::{read_boot_id, read_proc_starttime, Registry};
+use crate::state::{read_proc_starttime, registration_boot_id, Registry};
 use forkd_vmm::ClockSyncOutcome;
 
 const API_VERSION: &str = "v1";
@@ -1270,6 +1270,14 @@ async fn create_sandbox(
     // The kernel usually clears state within tens of milliseconds. Retry
     // up to 3 times with 50/200/800 ms backoff. ForkOpts and Snapshot are
     // Clone so we can hand a fresh copy to each attempt.
+    // Boot identity for sandbox registration (review #299): read it
+    // BEFORE any VM work so an environment where boot_id is unreadable
+    // fails the spawn loudly here instead of recording a silently-
+    // unverifiable row that would abort every future controller start.
+    let reg_boot_id = match registration_boot_id() {
+        Ok(b) => b,
+        Err(e) => return server_error(&format!("{e:#}")),
+    };
     let prewarm_requested = req.prewarm;
     let mut snapshot = snapshot;
     let head_tag_for_log = req.snapshot_tag.clone();
@@ -1539,7 +1547,7 @@ async fn create_sandbox(
                 created_at_unix: now,
                 pid: Some(vm.pid()),
                 proc_starttime: read_proc_starttime(vm.pid()),
-                boot_id: read_boot_id(),
+                boot_id: reg_boot_id.clone(),
                 memory_limit_mib: req.memory_limit_mib,
                 has_branched: false,
                 last_branch_memory_path: None,
@@ -2908,6 +2916,10 @@ fn spawn_one_for_workspace(
     Option<crate::netns::NetnsReservation>,
     Option<SharedTapClaim>,
 )> {
+    // Boot identity for registration (review #299): fail the spawn
+    // loudly if boot_id is unreadable rather than recording a row that
+    // can never pass startup identity verification.
+    let reg_boot_id = registration_boot_id()?;
     let snap_dir: PathBuf = match s.registry.get_snapshot(snapshot_tag) {
         Some(s) => PathBuf::from(&s.dir),
         None => s.snapshot_root.join(snapshot_tag),
@@ -2993,7 +3005,7 @@ fn spawn_one_for_workspace(
         created_at_unix: unix_now(),
         pid: Some(vm.pid()),
         proc_starttime: read_proc_starttime(vm.pid()),
-        boot_id: read_boot_id(),
+        boot_id: reg_boot_id,
         memory_limit_mib,
         has_branched: false,
         last_branch_memory_path: None,
