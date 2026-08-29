@@ -323,43 +323,39 @@ impl Registry {
     /// the allocator may still collide with them — the caller should
     /// log the failure count and the operator should investigate.
     pub(crate) fn kill_orphans(&self) -> Result<KillOrphansResult> {
-        // Count retained sandbox rows that have NO recorded PID before we
-        // prune/kill. Such an entry is legacy/corrupt identity (every
-        // production registration path writes `Some(pid)`), but the
-        // absence of a PID is NOT evidence that no live VM is holding its
-        // netns/tap resources — on the contrary, it mirrors the #298
-        // collision risk if we simply skip it and start with an empty
-        // allocator. The caller treats `unresolved > 0` as a startup
-        // blocker (fail closed).
-        let unresolved: usize = {
-            self.inner
-                .lock()
-                .sandboxes
-                .values()
-                .filter(|sb| sb.pid.is_none())
-                .count()
-        };
-
-        // Collect orphans with their recorded durable identity
-        // (start time + boot id). The lock is dropped before any kill
-        // so the (bounded) wait_for_death poll never holds the registry
-        // mutex.
-        let orphans: Vec<(String, u32, Option<u64>, Option<String>)> = {
+        // Single lock pass over retained rows (review #299 non-blocking:
+        // fold the previous two acquisitions into one guard):
+        //  - `unresolved`: rows with NO recorded PID. Such an entry is
+        //    legacy/corrupt identity (every production registration path
+        //    writes `Some(pid)`), but the absence of a PID is NOT evidence
+        //    that no live VM is holding its netns/tap resources — on the
+        //    contrary, it mirrors the #298 collision risk if we simply
+        //    skip it and start with an empty allocator. The caller treats
+        //    `unresolved > 0` as a startup blocker (fail closed).
+        //  - `orphans`: rows with a live PID, collected with their
+        //    recorded durable identity (start time + boot id). The lock
+        //    is dropped before any kill so the (bounded) wait_for_death
+        //    poll never holds the registry mutex.
+        let (unresolved, orphans): (usize, Vec<(String, u32, Option<u64>, Option<String>)>) = {
             let g = self.inner.lock();
-            g.sandboxes
-                .iter()
-                .filter_map(|(id, sb)| match sb.pid {
+            let mut unresolved = 0usize;
+            let mut orphans = Vec::new();
+            for (id, sb) in g.sandboxes.iter() {
+                match sb.pid {
                     Some(pid) if pid_alive(pid) => {
-                        Some((id.clone(), pid, sb.proc_starttime, sb.boot_id.clone()))
+                        orphans.push((id.clone(), pid, sb.proc_starttime, sb.boot_id.clone()))
                     }
-                    _ => None,
-                })
-                .collect()
+                    Some(_) => {} // dead PID: reconcile() has already pruned these
+                    None => unresolved += 1,
+                }
+            }
+            (unresolved, orphans)
         };
 
         let mut killed = 0usize;
         let mut pruned_stale = 0usize;
         let mut kill_failed = 0usize;
+        let mut legacy_unverified = 0usize;
 
         for (id, pid, recorded_starttime, recorded_boot_id) in orphans {
             // Primary identity check: compare the live process start time
@@ -421,10 +417,14 @@ impl Registry {
                     // closes the check→open TOCTOU window: if the PID was
                     // reused between process_identity_matches and
                     // pidfd_open, the live start time now differs from
-                    // the recorded one. Prune without killing (the pinned
-                    // process is not ours). Recorded_starttime is Some by
-                    // construction here (Match requires it), but guard for
-                    // clarity.
+                    // the recorded one. (Note: /proc/<pid> reflects
+                    // whoever CURRENTLY holds the PID — pidfd pinning
+                    // does NOT change that. The re-read is what makes
+                    // this safe: a mismatch proves the PID changed hands
+                    // before we pinned it.) Prune without killing: the
+                    // pinned process is not ours. Recorded_starttime is
+                    // Some by construction here (Match requires it), but
+                    // guard for clarity.
                     if let Some(recorded) = recorded_starttime {
                         match read_proc_starttime(pid) {
                             Some(live) if live == recorded => {
@@ -533,21 +533,43 @@ impl Registry {
                     pruned_stale += 1;
                 }
                 IdentityCheck::Unknown => {
-                    // No recorded start time (old state.json) OR the live
-                    // start time could not be read OR off-Linux. Fail
-                    // closed: do NOT kill (we can't prove the PID is ours),
-                    // and do NOT silently prune (the entry may be for a
-                    // legitimately-recoverable sandbox). Keep the entry so
-                    // the operator can investigate; the startup abort
-                    // check on kill_failed > 0 will surface this.
+                    // Identity genuinely unverifiable in THIS environment:
+                    // the live boot id or start time could not be read, or
+                    // off-Linux. Fail closed: do NOT kill (we can't prove
+                    // the PID is ours), and do NOT silently prune (the
+                    // entry may be for a legitimately-recoverable
+                    // sandbox). Keep the entry so the operator can
+                    // investigate; the startup abort check on
+                    // kill_failed > 0 will surface this.
                     tracing::warn!(
                         sandbox_id = %id,
                         pid = pid,
                         recorded_starttime = ?recorded_starttime,
-                        "cannot verify process identity (no recorded start time, \
-                         /proc unreadable, or off-Linux); keeping registry entry (fail closed)"
+                        "cannot verify process identity (live boot id or start time \
+                         unreadable, or off-Linux); keeping registry entry (fail closed)"
                     );
                     kill_failed += 1;
+                }
+                IdentityCheck::LegacyUnverifiable => {
+                    // The registry row itself predates durable identity
+                    // tracking (no recorded start time or boot id — serde
+                    // defaults when an old state.json is read by this
+                    // build). Fail closed, but with a distinct diagnostic
+                    // and counter so the upgrade path is recognizable
+                    // (review #299): the fix is to kill the PID manually
+                    // (or remove the entry once verified dead) before
+                    // restarting — not to debug the environment.
+                    tracing::warn!(
+                        sandbox_id = %id,
+                        pid = pid,
+                        "legacy registry row without recorded boot identity \
+                         (state.json written by an older forkd); cannot verify \
+                         the live PID is ours, keeping entry (fail closed). \
+                         Kill the PID manually (kill {}) or remove the entry \
+                         after verifying it is dead, then restart",
+                        pid
+                    );
+                    legacy_unverified += 1;
                 }
             }
         }
@@ -561,6 +583,7 @@ impl Registry {
             pruned_stale,
             kill_failed,
             unresolved,
+            legacy_unverified,
         })
     }
 
@@ -586,6 +609,12 @@ pub struct KillOrphansResult {
     /// recreate the #298 collision risk (startup succeeds with an empty
     /// allocator while a live VM may still hold those resources).
     pub unresolved: usize,
+    /// Retained sandbox entries whose row predates durable identity
+    /// tracking (no recorded start time or boot id). Startup aborts on
+    /// these too (fail closed), but with a distinct diagnostic: the
+    /// operator-facing fix is manual verification/removal of legacy
+    /// rows, not an environment investigation (review #299).
+    pub legacy_unverified: usize,
 }
 
 #[cfg(target_os = "linux")]
@@ -644,12 +673,20 @@ enum IdentityCheck {
     PidReuse,
     /// The process is gone (no `/proc/<pid>`). Prune the stale entry.
     Dead,
-    /// Identity could not be verified (no recorded start time, or the
-    /// live start time could not be read, or off-Linux). Fail closed:
+    /// Identity could not be verified (the live boot id or start time
+    /// could not be read, or off-Linux). Fail closed:
     /// `kill_orphans` keeps the entry and increments `kill_failed`
-    /// (aborting startup via `check_orphan_kill_result`) rather than
+    /// (aborting startup via the orphan identity gate) rather than
     /// risk killing an unidentifiable process.
     Unknown,
+    /// The registry row predates durable identity tracking: it carries
+    /// no recorded start time or boot id (serde defaults when an old
+    /// `state.json` is read by a newer forkd). Fail closed with a
+    /// DISTINCT diagnostic from `Unknown` (counted as
+    /// `legacy_unverified`, review #299): the operator-facing cause and
+    /// fix is "legacy row — kill the PID manually or remove the entry
+    /// before upgrading", not an environment/EPERM debugging session.
+    LegacyUnverifiable,
 }
 
 /// Read the Linux boot identity from `/proc/sys/kernel/random/boot_id`.
@@ -679,6 +716,38 @@ pub(crate) fn read_boot_id() -> Option<String> {
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn read_boot_id() -> Option<String> {
     None
+}
+
+/// Read the boot id for sandbox REGISTRATION (review #299). Unlike
+/// `read_boot_id`, a `None` here is treated as a spawn-blocking error
+/// rather than recorded silently: a sandbox registered without a boot
+/// id can never pass the startup identity check (its row would
+/// permanently take the fail-closed path), leaving the controller
+/// unable to start until state.json is hand-edited. Both production
+/// registration paths (http.rs) call this BEFORE any VM work so a
+/// degraded environment fails the spawn loudly instead of bricking
+/// the next restart.
+///
+/// Off-Linux this intentionally returns `Ok(None)`: registration on
+/// dev boxes must keep working (existing `#[cfg(not(target_os =
+/// "linux"))]` fallbacks), and orphan recovery already reports
+/// off-Linux rows via its own distinct diagnostics.
+#[cfg(target_os = "linux")]
+pub(crate) fn registration_boot_id() -> Result<Option<String>> {
+    match read_boot_id() {
+        Some(id) => Ok(Some(id)),
+        None => Err(anyhow::anyhow!(
+            "cannot read /proc/sys/kernel/random/boot_id; refusing to register a \
+             sandbox without boot identity (its recovery could never be verified, \
+             which would block every controller restart). Check that /proc is \
+             mounted and the controller runs in an unrestricted environment"
+        )),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn registration_boot_id() -> Result<Option<String>> {
+    Ok(None)
 }
 
 /// Read field 22 (starttime, clock ticks since boot) from
@@ -736,9 +805,11 @@ fn process_identity_matches(
         return IdentityCheck::Unknown;
     }
     let Some(recorded) = recorded_starttime else {
-        // No recorded identity (old state.json written before this field
-        // existed). We cannot prove the live PID is ours — fail closed.
-        return IdentityCheck::Unknown;
+        // No recorded start time: the row predates durable identity
+        // tracking (old state.json, serde default). A DISTINCT outcome
+        // from `Unknown` so the operator sees "legacy row" rather than
+        // an environment problem (review #299). Fail closed.
+        return IdentityCheck::LegacyUnverifiable;
     };
     // Boot identity gates the start-time comparison. If we cannot confirm
     // the recorded process was (or is) from the CURRENT boot, we must not
@@ -746,13 +817,16 @@ fn process_identity_matches(
     // a false `Match` against an unrelated Firecracker.
     match recorded_boot_id {
         None => {
-            // Missing recorded boot id → cannot prove current boot → fail
-            // closed (do not kill).
-            return IdentityCheck::Unknown;
+            // Missing recorded boot id: the row predates boot-id tracking
+            // (serde default on old state.json). We cannot prove which
+            // boot the process belongs to, so fail closed as a legacy
+            // row (review #299).
+            return IdentityCheck::LegacyUnverifiable;
         }
         Some(rec) => match read_boot_id() {
             None => {
-                // Live boot id unreadable → fail closed.
+                // Live boot id unreadable → fail closed (genuinely
+                // unverifiable environment, not a legacy row).
                 return IdentityCheck::Unknown;
             }
             Some(live) if live != rec => {
@@ -782,7 +856,15 @@ fn process_identity_matches(
     _recorded_starttime: Option<u64>,
     _recorded_boot_id: Option<&str>,
 ) -> IdentityCheck {
-    IdentityCheck::Unknown
+    // Off-Linux there is no /proc to verify against, so every sandbox
+    // row is unverifiable. Report LEGACY rows distinctly so a dev-box
+    // startup abort names the real cause (review #299 non-blocking:
+    // off-Linux builds fail with the same diagnostics).
+    if _recorded_starttime.is_none() || _recorded_boot_id.is_none() {
+        IdentityCheck::LegacyUnverifiable
+    } else {
+        IdentityCheck::Unknown
+    }
 }
 
 /// Open a pidfd for a live process (Linux 5.3+). Used to close the
@@ -1192,12 +1274,13 @@ mod tests {
         assert!(r.list_sandboxes().is_empty());
     }
 
-    /// New: an alive-PID entry with NO recorded start time (old state.json
-    /// written before proc_starttime existed) must FAIL CLOSED — the entry
-    // is kept and kill_failed is incremented, so the caller aborts startup
-    // rather than risking killing an unrelated process. This is the
-    // cross-platform (no /proc required) contract test for the fail-closed
-    // behavior the reviewer insisted on.
+    /// Upgrade-path contract (review #299): an alive-PID entry with NO
+    /// recorded start time (state.json written before identity tracking
+    /// existed) must FAIL CLOSED and be counted as `legacy_unverified`,
+    /// not `kill_failed` — the operator-facing cause and fix is "legacy
+    /// row, verify/kill the PID manually", which must be distinguishable
+    /// from a genuine kill failure. Cross-platform contract test (the
+    /// off-Linux stub reports legacy rows identically).
     #[test]
     fn kill_orphans_fails_closed_on_unknown_identity() {
         let td = TempDir::new().unwrap();
@@ -1212,9 +1295,10 @@ mod tests {
             guest_addr: "10.42.0.2:8888".into(),
             created_at_unix: 1,
             pid: Some(std::process::id()),
-            proc_starttime: None, // old state.json — identity unknown
+            proc_starttime: None, // old state.json — pre-identity-tracking row
             // Legacy entry with no boot id — we cannot verify which boot
-            // it belongs to, so the kill path fails closed (Unknown).
+            // it belongs to, so the kill path fails closed as
+            // LegacyUnverifiable (review #299).
             boot_id: None,
             memory_limit_mib: None,
             has_branched: false,
@@ -1224,15 +1308,20 @@ mod tests {
         .unwrap();
 
         let result = r.kill_orphans().unwrap();
-        // Fail closed: nothing killed, nothing pruned, kill_failed incremented.
+        // Fail closed: nothing killed, nothing pruned, the legacy counter
+        // is incremented (distinct from a genuine kill failure).
         assert_eq!(result.killed, 0, "must not kill with unknown identity");
         assert_eq!(
             result.pruned_stale, 0,
             "must not prune with unknown identity"
         );
         assert_eq!(
-            result.kill_failed, 1,
-            "must fail-closed on unknown identity"
+            result.legacy_unverified, 1,
+            "a pre-boot-id row must be counted as legacy_unverified (review #299)"
+        );
+        assert_eq!(
+            result.kill_failed, 0,
+            "legacy rows are counted separately from genuine kill failures"
         );
         // The entry is KEPT so the operator can investigate.
         assert_eq!(
@@ -1396,8 +1485,9 @@ mod tests {
         // Entry retained (not pruned) so the operator can inspect it.
         assert_eq!(r.list_sandboxes().len(), 1);
 
-        // And check_orphan_kill_result must fail closed on it.
-        assert!(crate::check_orphan_kill_result(&result).is_err());
+        // And the abort decision must fail closed on it (cross-platform
+        // decision function; the Linux gate turns Some into Err).
+        assert!(crate::orphan_abort_reason(&result).is_some());
     }
 
     #[test]
@@ -1574,7 +1664,7 @@ mod tests {
     /// zero-baseline contract.
     #[test]
     fn check_orphan_kill_result_aborts_on_kill_failure() {
-        use crate::check_orphan_kill_result;
+        use crate::orphan_abort_reason;
 
         // kill_failed > 0 must abort (EPERM, D-state timeout, etc.)
         let result = KillOrphansResult {
@@ -1582,13 +1672,14 @@ mod tests {
             pruned_stale: 0,
             kill_failed: 1,
             unresolved: 0,
+            legacy_unverified: 0,
         };
-        let outcome = check_orphan_kill_result(&result);
+        let outcome = orphan_abort_reason(&result);
         assert!(
-            outcome.is_err(),
+            outcome.is_some(),
             "kill_failed=1 must cause startup abort, got {outcome:?}"
         );
-        let err = outcome.unwrap_err().to_string();
+        let err = outcome.expect("expected an abort reason");
         assert!(
             err.contains("aborting startup"),
             "error should mention aborting startup, got: {err}"
@@ -1604,9 +1695,10 @@ mod tests {
             pruned_stale: 3,
             kill_failed: 0,
             unresolved: 0,
+            legacy_unverified: 0,
         };
         assert!(
-            check_orphan_kill_result(&result).is_ok(),
+            orphan_abort_reason(&result).is_none(),
             "kill_failed=0 should not abort even with killed/pruned entries"
         );
     }
@@ -1616,15 +1708,16 @@ mod tests {
     /// how many orphans need manual intervention.
     #[test]
     fn check_orphan_kill_result_error_contains_count() {
-        use crate::check_orphan_kill_result;
+        use crate::orphan_abort_reason;
 
         let result = KillOrphansResult {
             killed: 0,
             pruned_stale: 0,
             kill_failed: 3,
             unresolved: 0,
+            legacy_unverified: 0,
         };
-        let err = check_orphan_kill_result(&result).unwrap_err().to_string();
+        let err = orphan_abort_reason(&result).expect("kill_failed>0 must abort");
         assert!(
             err.contains('3'),
             "error should contain kill_failed count (3), got: {err}"
@@ -1643,7 +1736,7 @@ mod tests {
     /// resources — recreating the #298 collision risk.
     #[test]
     fn check_orphan_kill_result_aborts_on_unresolved() {
-        use crate::check_orphan_kill_result;
+        use crate::orphan_abort_reason;
 
         // unresolved > 0 (even with kill_failed == 0) must abort.
         let result = KillOrphansResult {
@@ -1651,13 +1744,14 @@ mod tests {
             pruned_stale: 0,
             kill_failed: 0,
             unresolved: 2,
+            legacy_unverified: 0,
         };
-        let outcome = check_orphan_kill_result(&result);
+        let outcome = orphan_abort_reason(&result);
         assert!(
-            outcome.is_err(),
+            outcome.is_some(),
             "unresolved=2 must cause startup abort, got {outcome:?}"
         );
-        let err = outcome.unwrap_err().to_string();
+        let err = outcome.expect("expected an abort reason");
         assert!(
             err.contains("aborting startup"),
             "error should mention aborting startup, got: {err}"
@@ -1673,10 +1767,93 @@ mod tests {
             pruned_stale: 0,
             kill_failed: 0,
             unresolved: 0,
+            legacy_unverified: 0,
         };
         assert!(
-            check_orphan_kill_result(&ok).is_ok(),
+            orphan_abort_reason(&ok).is_none(),
             "clean result should not abort startup"
+        );
+    }
+
+    /// Linux-only: the gate wiring itself — `check_orphan_kill_result`
+    /// must turn `orphan_abort_reason`'s Some into Err. (CI runs on Linux,
+    /// so this is the actually-executed startup gate in production.)
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn check_orphan_kill_result_gate_wiring_on_linux() {
+        let abort = KillOrphansResult {
+            killed: 0,
+            pruned_stale: 0,
+            kill_failed: 0,
+            unresolved: 0,
+            legacy_unverified: 1,
+        };
+        assert!(
+            crate::check_orphan_kill_result(&abort).is_err(),
+            "legacy_unverified must abort on Linux"
+        );
+        let clean = KillOrphansResult {
+            killed: 3,
+            pruned_stale: 1,
+            kill_failed: 0,
+            unresolved: 0,
+            legacy_unverified: 0,
+        };
+        assert!(
+            crate::check_orphan_kill_result(&clean).is_ok(),
+            "clean result must not abort on Linux"
+        );
+    }
+
+    /// Upgrade-path regression (review #299): rows written by an older
+    /// forkd carry no boot identity, so the first restart after upgrading
+    /// fail-closes on them. The abort must be DISTINCT from a genuine
+    /// kill failure (EPERM/timeout) so the operator sees "legacy row —
+    /// verify/kill the PID manually" rather than an environment
+    /// debugging session.
+    #[test]
+    fn check_orphan_kill_result_aborts_on_legacy_unverified() {
+        use crate::orphan_abort_reason;
+
+        // legacy_unverified > 0 (even with kill_failed == 0) must abort.
+        let result = KillOrphansResult {
+            killed: 0,
+            pruned_stale: 0,
+            kill_failed: 0,
+            unresolved: 0,
+            legacy_unverified: 1,
+        };
+        let outcome = orphan_abort_reason(&result);
+        assert!(
+            outcome.is_some(),
+            "legacy_unverified=1 must cause startup abort, got {outcome:?}"
+        );
+        let err = outcome.expect("expected an abort reason");
+        assert!(
+            err.contains("aborting startup"),
+            "error should mention aborting startup, got: {err}"
+        );
+        assert!(
+            err.contains("older forkd"),
+            "error should name the legacy-row cause, got: {err}"
+        );
+        assert!(
+            err.contains('1'),
+            "error should contain the legacy_unverified count, got: {err}"
+        );
+        // A genuine kill failure and a legacy row produce DIFFERENT
+        // diagnostics — the legacy message must not mention EPERM.
+        let killfail = KillOrphansResult {
+            killed: 0,
+            pruned_stale: 0,
+            kill_failed: 1,
+            unresolved: 0,
+            legacy_unverified: 0,
+        };
+        let err = orphan_abort_reason(&killfail).expect("kill_failed>0 must abort");
+        assert!(
+            err.contains("could not be killed") && !err.contains("older forkd"),
+            "kill-failure diagnostic must stay distinct from the legacy one, got: {err}"
         );
     }
 
