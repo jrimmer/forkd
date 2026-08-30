@@ -1273,6 +1273,118 @@ enum SidecarSource<'a> {
     RemoteSibling(&'a str),
 }
 
+/// Forkd-managed directory roots a packed `RootfsRef.target_path` is
+/// allowed to name. `snap_dir` is the DESTINATION snapshot dir of the
+/// unpack/pull in progress (its parent — `snapshots/` — is included, so
+/// a rootfs recorded beside any local snapshot dir is acceptable).
+///
+/// Covers where forkd itself keeps rootfs images:
+/// - `<data_dir>/snapshots/**` — RW bakes clone into the snapshot dir;
+///   also lets cross-tag pulls land inside the local snapshot store.
+/// - the rootfs cache root (`from-image --cache`, `FORKD_RUN_CACHE`,
+///   default `/var/cache/forkd`) — where cache-path bakes keep baselines.
+///
+/// Anything else fails validation, so a malicious manifest cannot direct
+/// a privileged (`sudo forkd unpack/pull`) write into e.g. `/etc/cron.d`
+/// (review #295 blocker 4), while packs produced by forkd itself restore
+/// verbatim on any host using the same conventional roots (review #295
+/// r9 blocker 2).
+fn rootfs_managed_roots(snap_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(parent) = snap_dir.parent() {
+        roots.push(parent.to_path_buf());
+    } else {
+        roots.push(snap_dir.to_path_buf());
+    }
+    roots.push(default_rootfs_cache_dir());
+    roots.push(forkd_vmm::paths::data_dir());
+    roots
+}
+
+/// Validate a manifest's `RootfsRef.target_path` and resolve it to the
+/// absolute destination path the sidecar must be placed at.
+///
+/// Rules (fail-closed):
+/// - non-empty, ABSOLUTE (forkd records the vmstate-frozen absolute
+///   path; relative paths — including the brief r6 relative format —
+///   are ambiguous and rejected);
+/// - no `..` components and no backslash separators;
+/// - LEXICALLY inside a [`rootfs_managed_roots`] entry — the sudo-write
+///   guard against manifest-directed escapes;
+/// - when the containing managed root EXISTS on disk, the longest
+///   existing prefix of the target must canonicalize inside the root's
+///   canonical form — symlink hardening (a symlink planted inside a
+///   managed root cannot smuggle the write outside it). A root that
+///   does not exist yet (fresh host, first `sudo forkd pull` creating
+///   `/var/cache/forkd`) is accepted lexically so directory creation
+///   keeps working exactly as before.
+fn validate_rootfs_target_path(
+    target_path: &str,
+    snap_dir: &std::path::Path,
+) -> Result<std::path::PathBuf> {
+    if target_path.trim().is_empty() {
+        bail!("unsafe rootfs target_path: empty string in manifest");
+    }
+    let raw = std::path::Path::new(target_path);
+    if !raw.is_absolute() {
+        bail!(
+            "unsafe rootfs target_path {target_path:?} in manifest: must be an absolute \
+             path (forkd records the exact path Firecracker reopens from the vmstate). \
+             Re-pack with a current forkd."
+        );
+    }
+    if raw
+        .components()
+        .any(|c| c == std::path::Component::ParentDir)
+    {
+        bail!(
+            "unsafe rootfs target_path {target_path:?} in manifest: `..` components \
+             are not allowed (path traversal)"
+        );
+    }
+    if target_path.contains('\\') {
+        bail!(
+            "unsafe rootfs target_path {target_path:?} in manifest: backslash separators \
+             are not allowed"
+        );
+    }
+    // Lexical containment first (cheap, no TOCTOU on the manifest side).
+    let roots = rootfs_managed_roots(snap_dir);
+    let containing = roots.iter().find(|r| raw.starts_with(r));
+    let Some(root) = containing else {
+        bail!(
+            "unsafe rootfs target_path {target_path:?} in manifest: outside every \
+             forkd-managed root (snapshot store, data dir, rootfs cache). Refusing to \
+             place the rootfs there — these commands often run via sudo. Allowed roots: \
+             the forkd data dir, its snapshots/ tree, and the rootfs cache \
+             (/var/cache/forkd or $FORKD_RUN_CACHE)."
+        );
+    };
+    // Symlink hardening: if the containing root exists, canonicalize the
+    // longest existing prefix of the target and require it to stay inside
+    // the canonical root. (An absolute path always has the `/` ancestor,
+    // which exists, so `find` below cannot come up empty.)
+    if root.exists() {
+        let prefix = raw.ancestors().find(|p| p.exists()).ok_or_else(|| {
+            anyhow::anyhow!("rootfs target_path {target_path:?} has no existing prefix to validate")
+        })?;
+        let canon_prefix = prefix
+            .canonicalize()
+            .with_context(|| format!("resolve {}", prefix.display()))?;
+        let canon_root = root
+            .canonicalize()
+            .with_context(|| format!("resolve root {}", root.display()))?;
+        if !canon_prefix.starts_with(&canon_root) {
+            bail!(
+                "unsafe rootfs target_path {target_path:?} in manifest: an existing path \
+                 component resolves outside the managed root {} (symlink escape)",
+                root.display()
+            );
+        }
+    }
+    Ok(raw.to_path_buf())
+}
+
 /// #242: ensure the rootfs a pulled/unpacked snapshot needs is present
 /// at the path Firecracker will reopen at restore. Skips when the
 /// target already exists with a matching sha (dedup across packs
@@ -1281,47 +1393,28 @@ enum SidecarSource<'a> {
 /// of a cryptic block-device error at first fork.
 ///
 /// `snap_dir` is the destination snapshot directory the pack was
-/// unpacked into. `rootfs.target_path` is a PORTABLE, host-independent
-/// path relative to `snap_dir` (review #295 r6 blocker 3 — e.g.
-/// `"rootfs.ext4"`); it is resolved against `snap_dir` to get the
-/// absolute path Firecracker reopens. A target_path that is absolute
-/// or contains `..` is REJECTED (fail-closed) — see the safety
-/// validation in the body (review #295 blocker 4 / 2026-08-22).
+/// unpacked into. `rootfs.target_path` is the packing host's ABSOLUTE
+/// rootfs path (review #295 r9 blocker 2 — restores the documented
+/// #242 design): Firecracker serializes the drive path into the binary
+/// vmstate and reopens it verbatim at restore, so placement must NOT
+/// depend on the destination snap_dir, tag, or data dir — a pack
+/// unpacked under a different --tag or on a host with a different
+/// data dir must still land the rootfs at the recorded path. Before
+/// anything is written the path is validated by
+/// [`validate_rootfs_target_path`] — fail-closed outside forkd-managed
+/// roots (review #295 blocker 4: these commands commonly run via sudo).
 fn satisfy_rootfs(
     rootfs: &hub::RootfsRef,
     source: SidecarSource,
     snap_dir: &std::path::Path,
 ) -> Result<()> {
-    // Review #295 blocker 4 / 2026-08-22: validate `target_path` BEFORE
-    // resolving it against snap_dir. A malicious/buggy manifest can
-    // supply `../../...` (or an absolute path) and sidecar placement
-    // would otherwise write outside the snapshot directory — dangerous
-    // because these commands are commonly run via sudo.
+    // Review #295 blockers 2+4 / r9: resolve the target ONCE through
+    // the root-validated path. A malicious manifest can still supply
+    // `../../...` or `/etc/cron.d/evil`; nothing is written unless the
+    // target resolves inside a forkd-managed root (the destination
+    // snapshot dir, the rootfs cache, or the forkd data dir).
     //
-    // Current forkd packs emit a PORTABLE, single-component relative
-    // filename (e.g. "rootfs.ext4" — see emit_rootfs_sidecar). We
-    // therefore require target_path to be a safe, bare filename:
-    //   - not absolute,
-    //   - exactly one path component (no `/`, no `\`, no leading `./`),
-    //   - no `.` or `..` components,
-    //   - non-empty.
-    // A legacy absolute path is refused (fail-closed) rather than honored
-    // with an unconditional write outside the snapshot dir, per the
-    // explicit-safe-migration requirement.
-    let target = std::path::Path::new(&rootfs.target_path);
-    let is_safe_filename = !target.is_absolute()
-        && target.components().count() == 1
-        && target.file_name().map(|n| !n.is_empty()).unwrap_or(false);
-    if !is_safe_filename {
-        return Err(anyhow::anyhow!(
-            "unsafe rootfs target_path {:?} in manifest (must be a single safe relative \
-             filename like \"rootfs.ext4\", no path separators / absolute / \"..\"). \
-             Re-pack with a current forkd; legacy absolute target_paths are not honored \
-             because they allow writing outside the snapshot directory.",
-            rootfs.target_path
-        ));
-    }
-    let dst = snap_dir.join(target);
+    let dst = validate_rootfs_target_path(&rootfs.target_path, snap_dir)?;
     if dst.exists() {
         if let Ok(existing) = hub::sha256_file(&dst) {
             if existing.eq_ignore_ascii_case(&rootfs.sha256) {
@@ -1341,13 +1434,13 @@ fn satisfy_rootfs(
                 .unwrap_or_else(|| std::path::Path::new("."))
                 .join(&name);
             if !sc.exists() {
-                eprintln!(
-                    "⚠ rootfs sidecar {name} not found next to the pack.\n   \
-                     This snapshot needs {} to restore. Place the sidecar beside \
-                     the pack, or rebuild locally with `forkd from-image`. (#242)",
+                bail!(
+                    "rootfs sidecar {name} not found next to the pack.\n   \
+                     This snapshot needs its rootfs at {} to restore — without it the \
+                     first fork fails with a block-device error. Publish the sidecar \
+                     beside the pack, or rebuild locally with `forkd from-image`. (#242)",
                     rootfs.target_path
                 );
-                return Ok(());
             }
             eprintln!(
                 "==> placing rootfs → {} (from {})",
@@ -1373,10 +1466,11 @@ fn satisfy_rootfs(
                 }
                 Err(e) => {
                     let _ = std::fs::remove_file(&tmp);
-                    eprintln!(
-                        "⚠ couldn't fetch rootfs sidecar from {sc_url}: {e}\n   \
-                         This snapshot needs {} to restore — rebuild locally with \
-                         `forkd from-image` if the sidecar isn't published. (#242)",
+                    bail!(
+                        "couldn't fetch rootfs sidecar from {sc_url}: {e}\n   \
+                         This snapshot needs its rootfs at {} to restore — publish the \
+                         sidecar beside the pack, or rebuild locally with \
+                         `forkd from-image`. (#242)",
                         rootfs.target_path
                     );
                 }
@@ -1559,11 +1653,14 @@ fn unpack_chain_into(
     );
     // The rootfs sidecar belongs to the head link — return its dest so
     // the caller can resolve the portable (relative) target_path against
-    // it in satisfy_rootfs.
+    // it in satisfy_rootfs. Bail (rather than an empty PathBuf) if the
+    // bundle somehow has no links: an empty tail would silently resolve
+    // target_path against the process CWD in satisfy_rootfs — under
+    // sudo, that is a stray rootfs write (review #295 nit).
     Ok(destinations
         .last()
         .cloned()
-        .unwrap_or_else(std::path::PathBuf::new))
+        .ok_or_else(|| anyhow::anyhow!("chain pack contained no links — nothing unpacked"))?)
 }
 
 /// Where `forkd pull <owner>/<name>` resolves names to download URLs by
@@ -1572,6 +1669,16 @@ fn unpack_chain_into(
 /// registry.
 const DEFAULT_HUB_REGISTRY_URL: &str =
     "https://raw.githubusercontent.com/deeplethe/forkd/main/registry.json";
+
+/// Default rootfs cache root — mirrors the `from-image --cache` default
+/// (`--cache` flag value, `FORKD_RUN_CACHE` env, else `/var/cache/forkd`).
+/// Used by `validate_rootfs_target_path` as an allowed placement root for
+/// packed rootfs sidecars.
+fn default_rootfs_cache_dir() -> std::path::PathBuf {
+    std::env::var("FORKD_RUN_CACHE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("/var/cache/forkd"))
+}
 
 /// Default rootfs image size in MiB. With sparse ext4 files (build-rootfs.sh
 /// uses `truncate`, not `dd`), physical disk usage is proportional to
@@ -2754,7 +2861,6 @@ fn snapshot_cmd(
             .with_context(|| format!("remove stale staging dir {}", staging_dir.display()))?;
     }
 
-    // src == dst guard (review #295 blocker 3 / 2026-08-22): cloning the
     // src == dst guard (review #295 blocker 3 / 2026-08-22): reject
     // cloning the baseline into the snapshot's own final rootfs path. See
     // `rootfs_clone_into_self` — canonical compare against the FINAL
@@ -2772,6 +2878,30 @@ fn snapshot_cmd(
         );
     }
 
+    // Review #295 blocker 1 (2026-08-22 r9): a re-bake must never
+    // DESTROY the previously published tag even if the new bake fails.
+    // For RW rootfs bakes, from here until publish_snapshot_metadata
+    // succeeds the old rootfs is preserved at `rootfs.ext4.prev-<pid>`;
+    // every failure path (clone error, boot error, snapshot error,
+    // metadata error, ctrl-C) restores it via the rollback guard below,
+    // so the tag keeps its last known-good (rootfs, vmstate,
+    // memory.bin, snapshot.json) tuple. Only a successful publish
+    // deletes the old file. (Previously the old rootfs was
+    // remove_file'd before the VM even booted, so any later failure
+    // left old metadata frozen against a replaced, dirtied rootfs —
+    // the exact #296 EBADMSG symptom, reachable without a crash.)
+    let prev_rootfs =
+        snap_dir.with_file_name(format!("{tag}.rootfs.ext4.prev-{}", std::process::id()));
+    if prev_rootfs.exists() {
+        // A stale leftover from a crashed run of this tag. Its owner
+        // never published, so it is untrusted scratch — drop it.
+        std::fs::remove_file(&prev_rootfs)
+            .with_context(|| format!("remove stale {} before re-bake", prev_rootfs.display()))?;
+    }
+    // Armed (Some) once the previous rootfs has been renamed aside;
+    // disarmed (taken + dropped) after a successful publish.
+    let mut rootfs_rollback: Option<RootfsRollback> = None;
+
     let boot_rootfs = if rw {
         // Blocker 1 (review r8/2026-08-22): the FC-visible rootfs drive
         // path is serialized into the binary vmstate at snapshot time and
@@ -2788,16 +2918,24 @@ fn snapshot_cmd(
             .with_context(|| format!("create snapshot dir {}", snap_dir.display()))?;
         let clone_path = snap_dir.join("rootfs.ext4");
         // `reflink_copy` opens the destination with `create_new(true)`
-        // (EEXIST on an existing file). On a re-snapshot/re-bake of an
-        // existing tag, snap_dir/rootfs.ext4 already exists from the prior
-        // bake. The self-clone guard above already ruled out
-        // `src == snap_dir/rootfs.ext4`, so removing a stale clone here is
-        // safe (we are replacing this tag's rootfs with a fresh clone of a
-        // DISTINCT baseline).
+        // (EEXIST on an existing file), so the fresh clone needs the
+        // published path free. The self-clone guard above already ruled
+        // out `src == snap_dir/rootfs.ext4`, so the file being renamed
+        // aside is this tag's own previous rootfs (preserved above).
         if clone_path.exists() {
-            std::fs::remove_file(&clone_path).with_context(|| {
-                format!("remove stale clone {} before re-bake", clone_path.display())
+            std::fs::rename(&clone_path, &prev_rootfs).with_context(|| {
+                format!(
+                    "preserve previous rootfs {} → {} before re-bake",
+                    clone_path.display(),
+                    prev_rootfs.display()
+                )
             })?;
+            rootfs_rollback = Some(RootfsRollback {
+                snap_dir: snap_dir.clone(),
+                clone_path: clone_path.clone(),
+                prev_rootfs: prev_rootfs.clone(),
+                armed: true,
+            });
         }
         eprintln!("    rootfs mode: read-write (ext4, immutable baseline clone)");
         eprintln!(
@@ -2938,6 +3076,23 @@ fn snapshot_cmd(
             snap_dir.display()
         )
     })?;
+    // Publish succeeded: the new snapshot is committed. Disarm the
+    // rollback guard and delete the PREVIOUS rootfs — from here on the
+    // tag is fully the new bake's.
+    if let Some(mut guard) = rootfs_rollback.take() {
+        guard.disarm();
+        match std::fs::remove_file(&guard.prev_rootfs) {
+            Ok(()) => eprintln!(
+                "    removed previous rootfs backup {}",
+                guard.prev_rootfs.display()
+            ),
+            Err(e) => eprintln!(
+                "    note: could not remove previous rootfs backup {} ({e}); \
+                 it is safe to delete by hand",
+                guard.prev_rootfs.display()
+            ),
+        }
+    }
     // Drop the staged-only dir (now empty of the files we renamed, or
     // holding only a leftover on a partial failure).
     let _ = std::fs::remove_dir_all(&staging_dir);
@@ -2984,25 +3139,74 @@ fn cleanup_workdir(work_dir: &std::path::Path) {
     }
 }
 
-/// Atomically publish a staged snapshot directory into `snap_dir`
-/// (review #295 r6: "stage under a distinct temporary path … and
-/// atomically publish only after success").
+/// Rollback guard for re-baking an existing tag (review #295 blocker 1,
+/// 2026-08-22 r9).
 ///
-/// `std::fs::rename` over an existing NON-empty directory fails with
-/// `ENOTEMPTY` on Linux, so this does a safe two-step shuffle:
+/// Once the previous published rootfs has been renamed aside to make
+/// room for the new clone, the tag is in a fragile intermediate state:
+/// the old metadata (snapshot.json/vmstate/memory.bin) still names
+/// `snap_dir/rootfs.ext4`, so the file at that path MUST be the old
+/// rootfs until the new snapshot is fully published. This guard owns
+/// that invariant:
 ///
-///   1. If `snap_dir` exists, move it aside to `snap_dir.old-<pid>`.
-///   2. Rename `staging` → `snap_dir` (the commit point).
-///   3. Drop the aside dir. (best-effort; logged on failure)
+/// - **Drop (armed)** — any early return (`?` on clone/boot/snapshot/
+///   publish) or panic unwinding: the partial new clone at
+///   `snap_dir/rootfs.ext4` is removed and the preserved previous
+///   rootfs is renamed back. The tag stays exactly as it was.
+/// - **disarm()** — called only after `publish_snapshot_metadata`
+///   succeeded, so the subsequent `remove_file` of the backup is
+///   best-effort and cannot strand a tag without a rootfs.
 ///
-/// If step 2 succeeds we are committed. If step 2 fails, restore the
-/// old `snap_dir` from the aside dir before returning the error, so a
-/// crash or failure leaves either the new OR the old snapshot intact,
-/// never neither. The aside dir sits beside `snap_dir` under the same
-/// data dir, so a crash between step 2 and step 3 leaves a stray
-/// `.old-<pid>` dir that a later run can clean up (it is never mistaken
-/// for a snapshot because `list_local` only enumerates valid snapshot
-/// dirs, and the `.old-` prefix keeps it out of tag-based lookups).
+/// There is a narrow crash window (kill -9 between boot and rollback)
+/// where neither rename ran; the `.prev-<pid>` name is left beside
+/// the snap dir and treated as untrusted scratch by the next run of
+/// the same tag.
+struct RootfsRollback {
+    snap_dir: std::path::PathBuf,
+    /// The in-progress clone living at the published path.
+    clone_path: std::path::PathBuf,
+    /// Where the previous rootfs is parked.
+    prev_rootfs: std::path::PathBuf,
+    /// Always true while the guard exists — it is only constructed
+    /// after the preserve-rename succeeded. The flag keeps `disarm()`
+    /// explicit and makes an unarmed state representable in tests.
+    armed: bool,
+}
+
+impl RootfsRollback {
+    /// Commit the new bake: never restore the previous rootfs. Takes
+    /// `&mut self` so the caller can still read `prev_rootfs` afterwards
+    /// to delete the backup; the disarmed Drop at scope end is a no-op.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for RootfsRollback {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // Best-effort ordering: remove the partial clone FIRST so the
+        // restore-rename cannot collide with an existing destination.
+        // If removal fails (permissions?), rename still overwrites
+        // regular files atomically on Linux.
+        let _ = std::fs::remove_file(&self.clone_path);
+        match std::fs::rename(&self.prev_rootfs, self.snap_dir.join("rootfs.ext4")) {
+            Ok(()) => eprintln!(
+                "    re-bake failed — restored previous rootfs from {}",
+                self.prev_rootfs.display()
+            ),
+            Err(e) => eprintln!(
+                "    WARNING: re-bake failed and previous rootfs could not be \
+                 restored from {} ({e}); the tag may be missing its rootfs — \
+                 restore it manually or re-bake",
+                self.prev_rootfs.display()
+            ),
+        }
+    }
+}
+
 /// Publish a snapshot's VOLATILE metadata (vmstate, memory.bin,
 /// snapshot.json) from a temporary `staging` dir into the target
 /// `snap_dir`, leaving the rootfs file (which lives at the stable
@@ -4224,23 +4428,80 @@ mod tests {
         );
     }
 
-    /// Review #295 blocker 4 / 2026-08-22: `satisfy_rootfs` must reject a
-    /// malicious `RootfsRef.target_path` that would escape the snapshot
-    /// dir (path traversal / absolute legacy path) BEFORE placing the
-    /// sidecar — otherwise the write lands outside `snap_dir`, which is
-    /// dangerous under sudo. Each unsafe shape must error and write
-    /// nothing.
+    /// Review #295 r9 blocker 1: the rollback guard must restore the
+    /// preserved previous rootfs and remove the partial clone when the
+    /// bake fails (drop while armed), and must NOT touch anything when
+    /// disarmed after a successful publish.
+    #[test]
+    fn rootfs_rollback_guard_restores_previous_rootfs_on_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let snap_dir = tmp.path().join("tag");
+        std::fs::create_dir_all(&snap_dir).unwrap();
+        let clone_path = snap_dir.join("rootfs.ext4");
+        let prev = tmp.path().join("tag.rootfs.ext4.prev-424242");
+
+        // Simulate the mid-bake state: previous rootfs parked aside,
+        // partial new clone sitting at the published path.
+        std::fs::write(&prev, b"PREVIOUS-GOOD").unwrap();
+        std::fs::write(&clone_path, b"PARTIAL-NEW-DIRTY").unwrap();
+
+        {
+            let mut guard = RootfsRollback {
+                snap_dir: snap_dir.clone(),
+                clone_path: clone_path.clone(),
+                prev_rootfs: prev.clone(),
+                armed: true,
+            };
+            guard.disarm(); // successful-publish path: nothing to restore
+        }
+        // Disarmed drop must not move anything.
+        assert!(clone_path.exists(), "disarmed drop must keep the new clone");
+        assert!(prev.exists(), "disarmed drop must keep the backup");
+
+        // Armed drop (failure path): clone removed, previous restored.
+        {
+            let _guard = RootfsRollback {
+                snap_dir: snap_dir.clone(),
+                clone_path: clone_path.clone(),
+                prev_rootfs: prev.clone(),
+                armed: true,
+            };
+            // dropping here = the "bake failed" scenario
+        }
+        assert!(
+            !clone_path.exists(),
+            "armed drop must remove the partial clone"
+        );
+        assert!(!prev.exists(), "armed drop must consume the backup");
+        assert_eq!(
+            std::fs::read(snap_dir.join("rootfs.ext4")).unwrap(),
+            b"PREVIOUS-GOOD",
+            "previous rootfs must be restored to the published path"
+        );
+    }
+
+    /// Review #295 blockers 2+4 / r9: `satisfy_rootfs` must never place
+    /// a rootfs outside a forkd-managed root, whatever a manifest
+    /// claims — traversal, absolute escapes, and (new) relative paths
+    /// must all fail CLOSED, while absolute paths inside the
+    /// destination snapshot dir / rootfs cache are honored (the r9
+    /// blocker-2 contract: target_path is the vmstate-frozen absolute
+    /// path, placed verbatim).
     #[test]
     fn satisfy_rootfs_rejects_unsafe_target_paths() {
         let tmp = tempfile::tempdir().unwrap();
-        let snap_dir = tmp.path().join("snap");
+        let snapshots_root = tmp.path().join("snapshots");
+        let snap_dir = snapshots_root.join("py"); // destination snap dir
         std::fs::create_dir_all(&snap_dir).unwrap();
 
         let unsafe_paths = [
             "../../etc/passwd",     // traversal
             "../../rootfs.ext4",    // escape one level
-            "/etc/cron.d/evil",     // absolute legacy path
+            "/etc/cron.d/evil",     // absolute path OUTSIDE managed roots
+            "/etc/passwd",          // ditto, existing file
             "foo/../bar",           // embedded ..
+            "rootfs.ext4",          // RELATIVE: r6-format pack, rejected
+            "./rootfs.ext4",        // relative with dot prefix
             "foo\\bar/rootfs.ext4", // separator via backslash
             "",                     // empty
             ".",                    // dot
@@ -4258,30 +4519,123 @@ mod tests {
                 &snap_dir,
             );
             assert!(res.is_err(), "unsafe target_path {bad:?} must be rejected");
-            // Nothing written outside the snapshot dir.
+            // Nothing written outside the snapshot tree.
             assert!(
                 !tmp.path().join("etc/passwd").exists(),
                 "traversal must not write to {bad:?}"
             );
         }
 
-        // The safe portable filename still works: it resolves inside snap_dir.
-        std::fs::write(snap_dir.join("rootfs.ext4"), b"rootfs-content").unwrap();
-        let good_sha = hub::sha256_file(&snap_dir.join("rootfs.ext4")).unwrap();
-        let good = hub::RootfsRef {
-            target_path: "rootfs.ext4".to_string(),
-            sha256: good_sha,
-            size: 0,
+        // An absolute path inside the destination snapshot tree is the
+        // honest r9 contract: accepted and placed verbatim.
+        let content = b"rootfs-content".to_vec();
+        let inside = snap_dir.join("rootfs.ext4");
+        // Build a sidecar next to a fake pack so placement succeeds.
+        let pack = tmp.path().join("pack.tar.zst");
+        std::fs::write(&pack, b"not-a-real-pack").unwrap();
+        let sha = {
+            // Write the rootfs into a source location, compress it as
+            // the sidecar the manifest will reference.
+            let src_rootfs = tmp.path().join("src.ext4");
+            std::fs::write(&src_rootfs, &content).unwrap();
+            let sha = hub::sha256_file(&src_rootfs).unwrap();
+            let sidecar = tmp.path().join(hub::rootfs_sidecar_name(&sha));
+            let enc = std::fs::File::create(&sidecar).unwrap();
+            let mut enc = zstd::Encoder::new(enc, 1).unwrap();
+            use std::io::Write;
+            enc.write_all(&content).unwrap();
+            enc.finish().unwrap();
+            sha
         };
-        let good_res = satisfy_rootfs(
-            &good,
-            SidecarSource::LocalSibling(&tmp.path().join("pack.tar.zst")),
-            &snap_dir,
-        );
-        assert!(
-            good_res.is_ok(),
-            "safe single-component target_path must be accepted"
-        );
+        let good = hub::RootfsRef {
+            target_path: inside.to_string_lossy().into_owned(),
+            sha256: sha,
+            size: content.len() as u64,
+        };
+        satisfy_rootfs(&good, SidecarSource::LocalSibling(&pack), &snap_dir)
+            .expect("absolute target inside the destination snapshot tree must be honored");
+        assert_eq!(std::fs::read(&inside).unwrap(), content);
+
+        // Same-target dedup: second call sees the sha match and skips.
+        satisfy_rootfs(&good, SidecarSource::LocalSibling(&pack), &snap_dir)
+            .expect("dedup re-call must succeed");
+    }
+
+    /// Review #295 r9 blocker 2 round-trip (the reviewer's ask):
+    /// unpacking a pack into a DIFFERENT snap_dir than it was packed
+    /// from — here simulated by a different --tag via `--tag
+    /// <other>` — must place the sidecar rootfs at the RECORDED
+    /// absolute path, not beside the destination snapshot. The
+    /// recorded path is validated (inside the snapshots tree) then
+    /// honored; satisfy_rootfs is snap_dir-independent by contract,
+    /// so both destinations resolve to the same final path.
+    #[test]
+    fn rootfs_target_path_places_verbatim_regardless_of_snap_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let snapshots_root = tmp.path().join("snapshots");
+        let packed_from = snapshots_root.join("orig-tag");
+        let unpacked_to = snapshots_root.join("other-tag");
+        std::fs::create_dir_all(&packed_from).unwrap();
+        std::fs::create_dir_all(&unpacked_to).unwrap();
+
+        let content = b"cross-host-rootfs".to_vec();
+        let canonical = packed_from.join("rootfs.ext4"); // recorded path
+        let pack = tmp.path().join("p.tar.zst");
+        std::fs::write(&pack, b"x").unwrap();
+        let sha = {
+            let src_rootfs = tmp.path().join("s.ext4");
+            std::fs::write(&src_rootfs, &content).unwrap();
+            let sha = hub::sha256_file(&src_rootfs).unwrap();
+            let sidecar = tmp.path().join(hub::rootfs_sidecar_name(&sha));
+            let enc = std::fs::File::create(&sidecar).unwrap();
+            let mut enc = zstd::Encoder::new(enc, 1).unwrap();
+            use std::io::Write;
+            enc.write_all(&content).unwrap();
+            enc.finish().unwrap();
+            sha
+        };
+        let rootfs = hub::RootfsRef {
+            target_path: canonical.to_string_lossy().into_owned(),
+            sha256: sha,
+            size: content.len() as u64,
+        };
+
+        // Unpack/pull into a different snap dir: placement must still
+        // land at the RECORDED path (identical bytes at that path).
+        satisfy_rootfs(&rootfs, SidecarSource::LocalSibling(&pack), &unpacked_to)
+            .expect("placement must be snap_dir-independent");
+        assert_eq!(std::fs::read(&canonical).unwrap(), content);
+    }
+
+    /// validate_rootfs_target_path unit contract (fast, exhaustive):
+    /// allowed roots honored verbatim; everything else fails closed.
+    #[test]
+    fn validate_rootfs_target_path_allows_managed_roots_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let snapshots_root = tmp.path().join("snapshots");
+        let snap_dir = snapshots_root.join("t");
+        std::fs::create_dir_all(&snap_dir).unwrap();
+
+        let ok = snap_dir.join("rootfs.ext4");
+        let resolved =
+            validate_rootfs_target_path(ok.to_str().unwrap(), &snap_dir).expect("inside dest");
+        assert_eq!(resolved, ok);
+
+        // Another snapshot's dir (same snapshots root) is also fine.
+        let other = snapshots_root.join("other").join("rootfs.ext4");
+        assert!(validate_rootfs_target_path(other.to_str().unwrap(), &snap_dir).is_ok());
+
+        for bad in [
+            "/etc/cron.d/x",
+            "/usr/local/share/evil.ext4",
+            "relative.ext4",
+        ] {
+            assert!(
+                validate_rootfs_target_path(bad, &snap_dir).is_err(),
+                "{bad} must be rejected"
+            );
+        }
+        assert!(validate_rootfs_target_path("", &snap_dir).is_err());
     }
 
     /// Review #295 blocker 3 / 2026-08-22: the exact same-tag regression.
@@ -4423,6 +4777,69 @@ mod tests {
             .restore_many_with(opts, &restore_dir)
             .expect("restore from published tag must succeed (blocker-1)");
         assert_eq!(res.children.len(), 1, "one child expected after restore");
+
+        // --- Blocker-1 r9 addendum: a FAILED re-bake must roll back. ---
+        // Simulate the mid-re-bake state directly (boot failure class):
+        // park the published rootfs aside, dirty a partial clone at the
+        // published path, then drop an armed guard.
+        let prev = root.join("snap.rootfs.ext4.prev-x");
+        std::fs::rename(&final_rootfs, &prev).expect("park published rootfs aside");
+        std::fs::write(&final_rootfs, b"partial-dirty-clone").expect("write partial clone");
+        {
+            let _guard = RootfsRollback {
+                snap_dir: snap_dir.clone(),
+                clone_path: final_rootfs.clone(),
+                prev_rootfs: prev.clone(),
+                armed: true,
+            };
+        }
+        assert!(
+            final_rootfs.exists(),
+            "rollback must restore the published rootfs after a failed re-bake"
+        );
+        assert!(!prev.exists(), "rollback consumes the backup");
+        // The rolled-back tag still restores (vmstate vs rootfs pairing intact).
+        let res2 = snap
+            .restore_many_with(opts, &restore_dir)
+            .expect("restore after failed-re-bake rollback must succeed (blocker-1 r9)");
+        assert_eq!(res2.children.len(), 1);
+
+        // --- Blocker-2 r9 addendum: sidecar placement is snap_dir- ---
+        // independent. Place the sidecar as if the pack had been
+        // unpacked under a DIFFERENT tag; the recorded absolute path
+        // (final_rootfs) must receive the bytes.
+        let content = std::fs::read(&final_rootfs).expect("read published rootfs");
+        let sha = hub::sha256_file(&final_rootfs).expect("hash rootfs");
+        let sidecar = root.join(hub::rootfs_sidecar_name(&sha));
+        {
+            let enc = std::fs::File::create(&sidecar).expect("create sidecar");
+            let mut enc = zstd::Encoder::new(enc, 1).expect("zstd encoder");
+            use std::io::Write;
+            enc.write_all(&content).expect("write sidecar body");
+            enc.finish().expect("finish zstd");
+        }
+        // Remove the rootfs, then satisfy from a totally different
+        // snap_dir (as `--tag other` would produce). Placement must be
+        // identical because it targets the RECORDED path.
+        std::fs::remove_file(&final_rootfs).expect("remove rootfs for placement test");
+        let other_snap_dir = root.join("other-tag");
+        std::fs::create_dir_all(&other_snap_dir).unwrap();
+        let rootfs_ref = hub::RootfsRef {
+            target_path: final_rootfs.to_string_lossy().into_owned(),
+            sha256: sha,
+            size: content.len() as u64,
+        };
+        satisfy_rootfs(
+            &rootfs_ref,
+            SidecarSource::LocalSibling(&sidecar),
+            &other_snap_dir,
+        )
+        .expect("cross-tag placement must land at the recorded path");
+        assert_eq!(
+            std::fs::read(&final_rootfs).expect("read placed rootfs"),
+            content,
+            "placed rootfs bytes must match"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }

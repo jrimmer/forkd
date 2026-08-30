@@ -104,11 +104,14 @@ pub struct Manifest {
     /// at `/var/cache/forkd/<image>.ext4`), so it never travels inside
     /// the `.tar.zst`. Instead it ships as a content-addressed sidecar
     /// asset (`<sha256>.rootfs.zst`, a sibling of the pack) and the
-    /// puller places it back at `target_path` — the exact path FC
-    /// reopens at restore. `None` for snapshots packed before this
-    /// existed, or whose rootfs path wasn't recorded (those packs are
-    /// only restorable on the packing host). Additive: older readers
-    /// `#[serde(default)]` ignore it, so no pack-version bump.
+    /// puller places it back at `target_path` — the exact vmstate-
+    /// frozen path FC reopens at restore, validated against forkd-
+    /// managed roots by the puller (review #295 r9 blocker 2). Placement
+    /// is independent of the destination snap_dir, so `--tag` overrides
+    /// and cross-data-dir pulls keep working. `None` for snapshots packed
+    /// before this existed, or whose rootfs path wasn't recorded (those
+    /// packs are only restorable on the packing host). Additive: older
+    /// readers `#[serde(default)]` ignore it, so no pack-version bump.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rootfs: Option<RootfsRef>,
 }
@@ -116,9 +119,15 @@ pub struct Manifest {
 /// Reference to a rootfs sidecar shipped alongside (not inside) a pack.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RootfsRef {
-    /// Absolute path Firecracker reopens at restore. The puller places
-    /// the decompressed rootfs here. Reproducible for `from-image`
-    /// bakes (`/var/cache/forkd/<image>.ext4`).
+    /// Absolute path Firecracker reopens at restore — the path the
+    /// packing host's vmstate has frozen into it, recorded verbatim.
+    /// The puller places the decompressed rootfs here after validating
+    /// it against forkd-managed roots (see `satisfy_rootfs`), so the
+    /// placement is independent of where the pack was unpacked or what
+    /// the destination `snap_dir`/tag/data dir is (review #295 r9:
+    /// blocker 2). Reproducible for `from-image` bakes
+    /// (`/var/cache/forkd/<image>.ext4`) and for RW bakes that clone
+    /// into the snapshot dir.
     pub target_path: String,
     /// sha256 of the **uncompressed** rootfs. Used both to name the
     /// sidecar (content-addressing → dedup across packs sharing a base)
@@ -949,18 +958,20 @@ fn emit_rootfs_sidecar(snap_dir: &Path, pack_path: &Path) -> Result<Option<Rootf
     }
 
     Ok(Some(RootfsRef {
-        // Review #295 r6 blocker 3: target_path is the PORTABLE,
-        // host-independent location the puller places the rootfs at —
-        // a path RELATIVE to the snapshot dir ("rootfs.ext4"), not the
-        // packing host's absolute path. The puller resolves it against
-        // its own snapshot dir so the same pack restores on any host
-        // regardless of where the packer kept its cache/snapshots.
-        // The content address is the sha256 (the sidecar name + the
-        // integrity check); target_path is only the in-snap-dir filename.
-        target_path: rootfs_path
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| rootfs_path.to_string_lossy().into_owned()),
+        // Review #295 r9 blocker 2: target_path is the packing host's
+        // ABSOLUTE rootfs path, recorded verbatim. Firecracker serializes
+        // the drive `path_on_host` into the binary vmstate and reopens
+        // that exact path on /snapshot/load (nothing on the restore path
+        // can override it), so a pack is only restorable when the rootfs
+        // exists at the recorded path. Making this snap_dir-relative
+        // (r6) broke cross-host restore whenever the destination
+        // snap_dir differed (different --tag or data dir): the sidecar
+        // landed beside the snapshot while the vmstate still named the
+        // packing host's path. Placement stays host-relative at satisfy
+        // time: the puller validates the path against forkd-managed
+        // roots before writing (fail-closed outside them) — see
+        // `satisfy_rootfs` in main.rs.
+        target_path: rootfs_path.to_string_lossy().into_owned(),
         sha256: sha,
         size,
     }))
