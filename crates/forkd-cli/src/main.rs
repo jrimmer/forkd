@@ -3217,6 +3217,16 @@ impl Drop for RootfsRollback {
 /// binary vmstate and reopens it on restore, so the rootfs clone must
 /// stay at the path the snapshot recorded.
 ///
+/// Before the first rename, `snapshot.json` is RE-POINTED at its
+/// post-rename location: it was serialized in the staging dir, so its
+/// `vmstate`/`memory` keys carry staging paths that would dangle once
+/// staging is deleted (Firecracker fails /snapshot/load with "Failed
+/// to open snapshot file" — caught by the first real-KVM run of the
+/// `snapshot_stable_rootfs_publishes_and_restores` regression). The
+/// repoint is safe precisely because vmstate/mem paths are /snapshot/
+/// load ARGUMENTS, unlike the drive path which is frozen into the
+/// binary vmstate and can never be patched (blocker-1 constraint).
+///
 /// Ordering: rename `vmstate` and `memory.bin` first, then
 /// `snapshot.json` LAST. `snapshot.json` is the restore entry point
 /// (`load_snapshot_meta`); a crash mid-publish therefore leaves either
@@ -3247,7 +3257,25 @@ fn publish_snapshot_metadata(staging: &std::path::Path, snap_dir: &std::path::Pa
             ));
         }
     }
-    // All present — now move them in snapshot.json-last order.
+    // All present — repoint snapshot.json at the post-rename location
+    // (see doc above), then move everything in snapshot.json-last order.
+    let staged_json = staging.join("snapshot.json");
+    let raw = std::fs::read_to_string(&staged_json)
+        .with_context(|| format!("read {} for path fixup", staged_json.display()))?;
+    let mut v: serde_json::Value = serde_json::from_str(&raw)
+        .with_context(|| format!("parse {} for path fixup", staged_json.display()))?;
+    if let Some(obj) = v.as_object_mut() {
+        for (key, file) in [("vmstate", "vmstate"), ("memory", "memory.bin")] {
+            obj.insert(
+                key.to_string(),
+                serde_json::Value::String(snap_dir.join(file).to_string_lossy().into_owned()),
+            );
+        }
+    }
+    let out = serde_json::to_string_pretty(&v).context("re-serialize snapshot.json")?;
+    std::fs::write(&staged_json, out)
+        .with_context(|| format!("write fixed-up {}", staged_json.display()))?;
+
     for name in META {
         let staged = staging.join(name);
         let dest = snap_dir.join(name);
@@ -4309,16 +4337,36 @@ mod tests {
         // Staging (new) metadata — note: NO rootfs.ext4 staged.
         let staging = dir.path().join("py.staging-123");
         std::fs::create_dir_all(&staging).unwrap();
-        std::fs::write(staging.join("snapshot.json"), b"NEW").unwrap();
+        // snapshot.json is serialized with STAGING paths, as snapshot_cmd does.
+        std::fs::write(
+            staging.join("snapshot.json"),
+            format!(
+                "{{\"vmstate\":\"{}\",\"memory\":\"{}\"}}",
+                staging.join("vmstate").display(),
+                staging.join("memory.bin").display()
+            ),
+        )
+        .unwrap();
         std::fs::write(staging.join("vmstate"), b"NEW-VMSTATE").unwrap();
         std::fs::write(staging.join("memory.bin"), b"NEW-MEM").unwrap();
 
         publish_snapshot_metadata(&staging, &snap_dir).expect("publish should succeed");
 
-        // Metadata replaced.
+        // Metadata replaced, and snapshot.json RE-POINTED at the final
+        // (post-rename) location rather than the staging paths it was
+        // written with.
+        let published: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(snap_dir.join("snapshot.json")).unwrap())
+                .unwrap();
         assert_eq!(
-            std::fs::read(snap_dir.join("snapshot.json")).unwrap(),
-            b"NEW"
+            published["vmstate"],
+            snap_dir.join("vmstate").to_string_lossy().as_ref(),
+            "vmstate key must be re-pointed at the final path"
+        );
+        assert_eq!(
+            published["memory"],
+            snap_dir.join("memory.bin").to_string_lossy().as_ref(),
+            "memory key must be re-pointed at the final path"
         );
         assert_eq!(
             std::fs::read(snap_dir.join("vmstate")).unwrap(),
@@ -4359,7 +4407,15 @@ mod tests {
         let snap_dir = dir.path().join("fresh-tag");
         let staging = dir.path().join("fresh-tag.staging-1");
         std::fs::create_dir_all(&staging).unwrap();
-        std::fs::write(staging.join("snapshot.json"), b"NEW").unwrap();
+        std::fs::write(
+            staging.join("snapshot.json"),
+            format!(
+                "{{\"vmstate\":\"{}\",\"memory\":\"{}\"}}",
+                staging.join("vmstate").display(),
+                staging.join("memory.bin").display()
+            ),
+        )
+        .unwrap();
         std::fs::write(staging.join("vmstate"), b"NEW-VMSTATE").unwrap();
         std::fs::write(staging.join("memory.bin"), b"NEW-MEM").unwrap();
 
@@ -4367,9 +4423,13 @@ mod tests {
             .expect("publish to fresh dir should succeed");
 
         assert!(snap_dir.exists());
+        let published: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(snap_dir.join("snapshot.json")).unwrap())
+                .unwrap();
         assert_eq!(
-            std::fs::read(snap_dir.join("snapshot.json")).unwrap(),
-            b"NEW"
+            published["vmstate"],
+            snap_dir.join("vmstate").to_string_lossy().as_ref(),
+            "fresh publish must also re-point snapshot.json"
         );
         assert_eq!(
             std::fs::read(snap_dir.join("vmstate")).unwrap(),
@@ -4396,7 +4456,15 @@ mod tests {
         // installed.
         let staging = dir.path().join("py.staging-999");
         std::fs::create_dir_all(&staging).unwrap();
-        std::fs::write(staging.join("snapshot.json"), b"NEW").unwrap();
+        std::fs::write(
+            staging.join("snapshot.json"),
+            format!(
+                "{{\"vmstate\":\"{}\",\"memory\":\"{}\"}}",
+                staging.join("vmstate").display(),
+                staging.join("memory.bin").display()
+            ),
+        )
+        .unwrap();
         std::fs::write(staging.join("vmstate"), b"NEW-VMSTATE").unwrap();
 
         let err = publish_snapshot_metadata(&staging, &snap_dir).unwrap_err();
@@ -4752,6 +4820,16 @@ mod tests {
 
         // Publish metadata only — the rootfs stays at the stable path.
         publish_snapshot_metadata(&staging, &snap_dir).expect("publish metadata");
+        // Reload from the PUBLISHED snapshot.json — exactly what
+        // `forkd fork --tag` does via load_snapshot_meta. Restoring from
+        // the in-memory `snap` would use the staging paths that publish
+        // just renamed away, hiding any repoint bug.
+        let snap = load_snapshot_meta(&snap_dir).expect("load published metadata");
+        assert_eq!(
+            snap.vmstate,
+            snap_dir.join("vmstate"),
+            "published metadata must carry final (post-rename) vmstate path"
+        );
         // Confirm the transient staging artifacts are gone (reviewer ask).
         assert!(
             !staging.join("vmstate").exists()
