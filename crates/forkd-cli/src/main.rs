@@ -4776,6 +4776,14 @@ mod tests {
         let res = snap
             .restore_many_with(opts(), &restore_dir)
             .expect("restore from published tag must succeed (blocker-1)");
+        // Failures are collected per-child (partial-success contract), so
+        // an Ok result can still hide a dead child — assert them empty and
+        // PRINT the phase + error, otherwise 0 children is undiagnosable.
+        assert!(
+            res.failures.is_empty(),
+            "restore failures: {:#?}",
+            res.failures
+        );
         assert_eq!(res.children.len(), 1, "one child expected after restore");
 
         // --- Blocker-1 r9 addendum: a FAILED re-bake must roll back. ---
@@ -4802,6 +4810,11 @@ mod tests {
         let res2 = snap
             .restore_many_with(opts(), &restore_dir)
             .expect("restore after failed-re-bake rollback must succeed (blocker-1 r9)");
+        assert!(
+            res2.failures.is_empty(),
+            "post-rollback restore failures: {:#?}",
+            res2.failures
+        );
         assert_eq!(res2.children.len(), 1);
 
         // --- Blocker-2 r9 addendum: sidecar placement is snap_dir- ---
