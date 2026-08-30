@@ -1652,15 +1652,15 @@ fn unpack_chain_into(
         final_tags.last().cloned().unwrap_or_default()
     );
     // The rootfs sidecar belongs to the head link — return its dest so
-    // the caller can resolve the portable (relative) target_path against
-    // it in satisfy_rootfs. Bail (rather than an empty PathBuf) if the
-    // bundle somehow has no links: an empty tail would silently resolve
+    // the caller can resolve the target_path against it in
+    // satisfy_rootfs. Bail (rather than an empty PathBuf) if the bundle
+    // somehow has no links: an empty tail would silently resolve
     // target_path against the process CWD in satisfy_rootfs — under
     // sudo, that is a stray rootfs write (review #295 nit).
-    Ok(destinations
+    destinations
         .last()
         .cloned()
-        .ok_or_else(|| anyhow::anyhow!("chain pack contained no links — nothing unpacked"))?)
+        .ok_or_else(|| anyhow::anyhow!("chain pack contained no links — nothing unpacked"))
 }
 
 /// Where `forkd pull <owner>/<name>` resolves names to download URLs by
@@ -4768,13 +4768,14 @@ mod tests {
 
         // Restore from the published tag: the vmstate reopens
         // snap_dir/rootfs.ext4 (the recorded path), which still exists.
-        let opts = ForkOpts {
+        // (restore_many_with consumes opts, so each call builds its own.)
+        let opts = || ForkOpts {
             n: 1,
             memory_backend: forkd_vmm::MemoryBackend::File,
             ..ForkOpts::default()
         };
         let res = snap
-            .restore_many_with(opts, &restore_dir)
+            .restore_many_with(opts(), &restore_dir)
             .expect("restore from published tag must succeed (blocker-1)");
         assert_eq!(res.children.len(), 1, "one child expected after restore");
 
@@ -4800,7 +4801,7 @@ mod tests {
         assert!(!prev.exists(), "rollback consumes the backup");
         // The rolled-back tag still restores (vmstate vs rootfs pairing intact).
         let res2 = snap
-            .restore_many_with(opts, &restore_dir)
+            .restore_many_with(opts(), &restore_dir)
             .expect("restore after failed-re-bake rollback must succeed (blocker-1 r9)");
         assert_eq!(res2.children.len(), 1);
 
