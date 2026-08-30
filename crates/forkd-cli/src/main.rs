@@ -4468,15 +4468,14 @@ mod tests {
             };
             // dropping here = the "bake failed" scenario
         }
-        assert!(
-            !clone_path.exists(),
-            "armed drop must remove the partial clone"
-        );
+        // After rollback the published path exists AGAIN — but holding
+        // the restored previous rootfs (rename-over replaced the partial
+        // clone), so assert on content, not absence.
         assert!(!prev.exists(), "armed drop must consume the backup");
         assert_eq!(
-            std::fs::read(snap_dir.join("rootfs.ext4")).unwrap(),
+            std::fs::read(&clone_path).unwrap(),
             b"PREVIOUS-GOOD",
-            "previous rootfs must be restored to the published path"
+            "armed drop must replace the partial clone with the previous rootfs"
         );
     }
 
