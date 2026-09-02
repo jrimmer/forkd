@@ -80,6 +80,93 @@ fn unauthenticated_non_loopback(bind: SocketAddr, token_file: Option<&Path>) -> 
     token_file.is_none() && !bind.ip().is_loopback()
 }
 
+/// Post-`kill_orphans` startup decision: abort if any orphan could
+/// not be killed (EPERM, D-state timeout, etc.). The NetnsAllocator
+/// active set and `shared_tap_owner` start empty, so a new spawn could
+/// reuse the still-alive orphan's netns index or tap lease — the exact
+/// collision #298 is meant to prevent. Returning `Err` here causes
+/// `run_daemon` to exit before binding the HTTP listener, so no spawns
+/// can be admitted.
+pub(crate) fn check_orphan_kill_result(orphans: &crate::state::KillOrphansResult) -> Result<()> {
+    gate_orphan_kill_result(orphans)
+}
+
+/// Cross-platform abort decision as a message: returns `Some(diagnostic)`
+/// for the first fail-closed condition, `None` when startup may proceed.
+/// Pure so the abort-contract tests exercise real behavior on every
+/// platform; the platform split lives only in `gate_orphan_kill_result`.
+fn orphan_abort_reason(orphans: &crate::state::KillOrphansResult) -> Option<String> {
+    if orphans.kill_failed > 0 {
+        return Some(format!(
+            "aborting startup: {} orphaned Firecracker process(es) could not be killed \
+             (EPERM or did not exit within timeout); refusing to accept spawns that may \
+             collide with still-alive orphans. Kill them manually and restart.",
+            orphans.kill_failed
+        ));
+    }
+    if orphans.legacy_unverified > 0 {
+        // Distinct upgrade-path diagnostic (review #299): these rows
+        // predate boot-id/start-time tracking, so the fix is manual
+        // verification/removal of legacy entries — not an EPERM or
+        // environment investigation.
+        return Some(format!(
+            "aborting startup: {} sandbox entr(y/ies) were written by an older forkd and \
+             carry no recorded boot identity (start time / boot id), so the controller \
+             cannot verify the recorded PID(s) are still its own Firecracker processes; \
+             refusing to start with a possibly-live unverified VM holding netns/tap \
+             resources. Verify each recorded PID (state.json) and kill it if it is a \
+             live firecracker, or remove the entry once confirmed dead, then restart. \
+             New registrations persist full identity, so this recurs only for rows \
+             created before the upgrade.",
+            orphans.legacy_unverified
+        ));
+    }
+    if orphans.unresolved > 0 {
+        return Some(format!(
+            "aborting startup: {} retained sandbox entr(y/ies) have no recorded PID and \
+             cannot be attributed to a live or dead process; refusing to start with an \
+             empty allocator/shared-tap ownership that may collide with a live VM still \
+             holding those resources (#298). Inspect the registry and remove/repair them, \
+             then restart.",
+            orphans.unresolved
+        ));
+    }
+    None
+}
+
+/// Linux gate: every abort condition applies. On Linux the controller
+/// can always read /proc and verify identity, so any kill_failed /
+/// legacy_unverified / unresolved row means real, possibly-live
+/// resources we cannot attribute — fail closed.
+#[cfg(target_os = "linux")]
+fn gate_orphan_kill_result(orphans: &crate::state::KillOrphansResult) -> Result<()> {
+    match orphan_abort_reason(orphans) {
+        Some(reason) => Err(anyhow::anyhow!(reason)),
+        None => Ok(()),
+    }
+}
+
+/// Off-Linux gate (review #299 non-blocking): identity can NEVER be
+/// verified without /proc, so every retained sandbox row would take
+/// the fail-closed path and abort startup. That makes local dev
+/// builds unusable, and the guarantees the gate protects (pidfd
+/// signaling decisions, Firecracker orphans holding netns/tap) are
+/// Linux-only concerns. Log the counts loudly and allow startup;
+/// Linux deployments get the full gate.
+#[cfg(not(target_os = "linux"))]
+fn gate_orphan_kill_result(orphans: &crate::state::KillOrphansResult) -> Result<()> {
+    if orphan_abort_reason(orphans).is_some() {
+        tracing::warn!(
+            kill_failed = orphans.kill_failed,
+            legacy_unverified = orphans.legacy_unverified,
+            unresolved = orphans.unresolved,
+            "orphan identity gate skipped off-Linux (no /proc to verify \
+             process identity); counts logged for operator visibility"
+        );
+    }
+    Ok(())
+}
+
 /// Bring up the controller daemon. Blocks until the listener exits.
 /// SIGTERM and SIGINT trigger a graceful shutdown; SIGHUP reopens the
 /// configured audit log after external rotation.
@@ -90,6 +177,45 @@ pub async fn run_daemon(cfg: DaemonConfig) -> Result<()> {
     if pruned > 0 {
         tracing::info!(pruned, "reconciled stale sandbox entries on startup");
     }
+
+    // Kill orphaned Firecracker processes left over from a previous
+    // controller instance (issue #298). After reconcile() prunes
+    // dead-PID entries, any remaining entries have alive PIDs but no
+    // live_vms handle — they are unmanageable orphans. Kill them and
+    // prune the registry entries so the NetnsAllocator (empty active
+    // set) and shared_tap_owner (None) start clean.
+    let orphans = registry.kill_orphans()?;
+    if orphans.killed > 0 {
+        tracing::info!(
+            killed = orphans.killed,
+            pruned_stale = orphans.pruned_stale,
+            kill_failed = orphans.kill_failed,
+            unresolved = orphans.unresolved,
+            legacy_unverified = orphans.legacy_unverified,
+            "killed orphaned Firecracker processes on startup"
+        );
+    } else if orphans.pruned_stale > 0
+        || orphans.kill_failed > 0
+        || orphans.unresolved > 0
+        || orphans.legacy_unverified > 0
+    {
+        tracing::warn!(
+            pruned_stale = orphans.pruned_stale,
+            kill_failed = orphans.kill_failed,
+            unresolved = orphans.unresolved,
+            legacy_unverified = orphans.legacy_unverified,
+            "orphan recovery: some entries pruned as stale, unresolved, legacy-unverified, or kill failed"
+        );
+    }
+
+    // Fail closed: if any orphan could not be killed (EPERM, D-state
+    // timeout, etc.), the controller cannot guarantee a clean resource
+    // state. The NetnsAllocator active set and shared_tap_owner start
+    // empty, so a new spawn could reuse the still-alive orphan's netns
+    // index or tap lease — the exact collision #298 is meant to prevent.
+    // Abort startup so the operator intervenes rather than silently
+    // admitting conflicting spawns. (review #299)
+    check_orphan_kill_result(&orphans)?;
 
     let audit = AuditSink::open(&cfg.audit_log)
         .with_context(|| format!("open audit log {}", cfg.audit_log.display()))?;

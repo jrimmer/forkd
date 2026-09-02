@@ -6,6 +6,20 @@ Versioning](https://semver.org/spec/v2.0.0.html) once it reaches
 
 ## Unreleased
 
+### Upgrade note: legacy sandbox rows block startup
+
+The controller now persists a boot identity (start time + boot id) for every
+sandbox it registers and, on startup, refuses to kill an orphaned Firecracker
+process whose identity it cannot verify — including rows written by an older
+forkd, which carry no boot identity. If you upgrade while sandboxes are live,
+the controller will abort startup with a `legacy registry row` diagnostic
+instead of risking a kill against an unverified PID. Kill the recorded PIDs
+manually (or remove the entries from `state.json` after confirming the
+processes are dead) before restarting; every sandbox spawned by the new
+version persists full identity, so this recurs only for pre-upgrade rows.
+Spawns are now also rejected up front if the boot id cannot be read, rather
+than registering a sandbox that could never be verified later.
+
 ### Safe re-snapshot of existing tags
 
 Re-running `forkd snapshot` on an existing tag no longer risks destroying
