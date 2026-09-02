@@ -306,6 +306,39 @@ pub struct SandboxInfo {
     pub guest_addr: String,
     pub created_at_unix: u64,
     pub pid: Option<u32>,
+    /// Process start time in clock ticks since boot (field 22 of
+    /// `/proc/<pid>/stat`), captured at VM registration. Used on
+    /// controller restart to detect PID reuse: if the recorded PID now
+    /// points to a process with a different start time, the original
+    /// Firecracker has exited and the PID was recycled — we must prune
+    /// the stale registry entry rather than kill an unrelated process.
+    ///
+    /// `#[serde(default)]` keeps existing `state.json` files loadable
+    /// (entries written before this field existed deserialize to
+    /// `None`, which is treated as "identity unknown — fail closed:
+    /// keep the entry and increment `kill_failed` rather than risk
+    /// killing an unidentifiable process").
+    #[serde(default)]
+    pub proc_starttime: Option<u64>,
+    /// Linux boot identity (`/proc/sys/kernel/random/boot_id`) captured
+    /// at VM registration, alongside `proc_starttime`.
+    ///
+    /// `proc_starttime` is ticks since boot and is therefore only unique
+    /// *within* a single boot. The registry persists across host reboots
+    /// (`/var/lib/forkd/state.json`), so after a reboot an unrelated
+    /// Firecracker can in principle share both the numeric PID and the
+    /// boot-relative start tick of a recorded entry; a bare starttime
+    /// check would then report `Match` and SIGKILL the wrong process
+    /// (review #299). We persist the boot id at registration and verify
+    /// it on recovery: a different boot id means the old process cannot
+    /// still exist (prune without signaling); a missing/unreadable boot
+    /// id fails closed (do not kill).
+    ///
+    /// `#[serde(default)]` keeps older `state.json` entries loadable;
+    /// entries written before this field deserialize to `None`, which
+    /// fails closed on the kill path.
+    #[serde(default)]
+    pub boot_id: Option<String>,
     pub memory_limit_mib: Option<u64>,
     /// Set to true once any BRANCH (Full or Diff) has been taken from
     /// this sandbox. Diagnostic flag — phase 1d (v0.3.1) lifted the
