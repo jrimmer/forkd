@@ -310,6 +310,19 @@ fn copy_base_memory(src: &Path, dst: &Path) -> Result<u64> {
     }
 
     // Fall through to stream copy. Same fds; rewind both and copy.
+    //
+    // Logged, because this is otherwise indistinguishable from success: a
+    // full streamed copy of a multi-GiB rootfs looks exactly like a clone from
+    // the outside. That is what hid a wrong FICLONE number for the life of this
+    // function — every call fell through here, silently, and the only symptom
+    // was disk.
+    tracing::warn!(
+        src = %src.display(),
+        dst = %dst.display(),
+        errno = raw,
+        errno_name = %errno,
+        "reflink unavailable for this pair; streaming a full copy"
+    );
     fallback_stream_copy(src_f, dst_f, src, dst)
 }
 
