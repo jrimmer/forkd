@@ -275,9 +275,14 @@ fn copy_base_memory(src: &Path, dst: &Path) -> Result<u64> {
     // EINVAL/EXDEV/EOPNOTSUPP signal "this FS doesn't support
     // reflink for this pair," in which case we fall back. ENOTSUP
     // sometimes appears too.
-    // ioctl number: _IO(0x94, 9). 0x94 is the BTRFS_IOCTL_MAGIC also
-    // used by ficlone (overlayfs, btrfs, xfs, ext4-reflink).
-    const FICLONE: libc::c_ulong = 0x4020_9409;
+    // ioctl number: `_IOW(0x94, 9, int)` from <linux/fs.h>. The size field
+    // is part of the value the kernel dispatches on, so `0x4020_9409` —
+    // which encodes a 32-byte payload, FICLONERANGE's size — is answered
+    // with ENOTTY. That lands in the "no reflink here" branch below, so
+    // every copy this helper made was a full streamed copy, silently.
+    // Measured on ZFS, same pool and source file:
+    //   0x40209409 -> ENOTTY      0x40049409 -> clone
+    const FICLONE: libc::c_ulong = 0x4004_9409;
     // SAFETY: both fds are valid open file descriptors; FICLONE
     // takes the source fd as its argument.
     let rc = unsafe { libc::ioctl(dst_f.as_raw_fd(), FICLONE, src_f.as_raw_fd()) };
