@@ -39,6 +39,20 @@ pub struct Registry {
     path: PathBuf,
 }
 
+/// The directory a restore's work dir is named for, under [`work_dir_root`].
+/// One helper for both ends: the spawn path creates these, and the startup
+/// sweep reclaims the rootfs backings stranded in them, so the two must agree
+/// on where to look even when `TMPDIR` changes.
+pub(crate) const WORK_DIR_PREFIX: &str = "forkd-daemon-";
+
+/// Where restore work dirs live: the controller's temp dir. A child's rootfs
+/// backing lives in its work dir, so on a host where `/tmp` is tmpfs, point
+/// `TMPDIR` at the snapshot root's filesystem — both so the backings are not
+/// charged to RAM and so the reflink clone has both ends on one filesystem.
+pub(crate) fn work_dir_root() -> PathBuf {
+    std::env::temp_dir()
+}
+
 impl Registry {
     pub fn load_or_init(path: impl Into<PathBuf>) -> Result<Self> {
         let path: PathBuf = path.into();
@@ -420,7 +434,7 @@ impl Registry {
                 None => return,
             }
         }
-        let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+        let Ok(entries) = std::fs::read_dir(work_dir_root()) else {
             return;
         };
         for entry in entries.flatten() {
@@ -428,7 +442,7 @@ impl Registry {
                 continue;
             }
             let name = entry.file_name().to_string_lossy().into_owned();
-            if !name.starts_with("forkd-daemon-") {
+            if !name.starts_with(WORK_DIR_PREFIX) {
                 continue;
             }
             let dir = entry.path();
